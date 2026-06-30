@@ -1,30 +1,133 @@
 # Task Graph
 
-Task Graph 是一个以用户选择来源为边界的 Obsidian Tasks 可编辑地图。
+Task Graph 是一款面向 Obsidian 的可编辑任务依赖图插件。它把 Markdown 中的
+[Obsidian Tasks](https://github.com/obsidian-tasks-group/obsidian-tasks) 任务组织成多张独立地图，
+帮助你看清任务之间的前置关系、当前阻塞和下一步行动。
 
-- 创建多张互相独立的命名地图。
-- 选择多个 Markdown 文件或递归文件夹作为地图来源。
-- 在侧栏、工具栏或画布空白处创建任务。
-- 使用 Tasks 完整表单创建、编辑任务与后续任务。
-- 自由拖动节点并分别保存每张地图的坐标和视口。
-- 点击“规整”按依赖关系从左到右重新布局。
+> 当前版本：`0.3.3`。项目仍处于早期开发阶段，建议先在测试 Vault 或已备份的笔记中使用写入功能。
 
-Tasks 关系沿用原生 Markdown 语法：
+## 核心能力
+
+- 创建、重命名和删除多张互相独立的任务地图。
+- 为每张地图选择多个 Markdown 文件或递归文件夹作为来源。
+- 解析 Tasks 状态、任务 ID、依赖、日期、优先级、标签和星标。
+- 自动判断任务是可开始、进行中、被阻塞、已完成还是已取消。
+- 检测缺失 ID、重复 ID、缺失引用和循环依赖。
+- 搜索任务、标签、ID 或文件路径，并保留匹配任务的上下游关系。
+- 按状态筛选，查看任务详情并跳转到 Markdown 原文。
+- 拖动节点和缩放画布；每张地图分别保存节点位置与视口。
+- 按依赖关系从左到右自动规整布局。
+- 在图中创建、编辑、删除任务，以及添加前置或后续任务。
+- 拖动节点连接点建立依赖；点击依赖线可确认解除关系。
+- 修改任务状态、标签和星标，并为关系任务生成或修复唯一 ID。
+- 监听来源文件的创建、修改、删除和重命名并刷新地图。
+
+## 任务关系格式
+
+Task Graph 直接读取和写回 Markdown，不维护第二套任务数据库。正式依赖关系沿用 Tasks 的
+`🆔` 与 `⛔` 字段：
 
 ```md
-- [ ] 项目 🆔 root001
-- [ ] 子任务 🆔 task001 ⛔ root001
+- [ ] 项目规划 🆔 root001
+- [/] 设计界面 🆔 design01 ⛔ root001
+- [ ] 开发画布 🆔 canvas01 ⛔ root001,design01
 ```
+
+图中箭头方向为：
+
+```text
+前置任务 ──────> 依赖它的任务
+```
+
+没有参与依赖关系的任务可以不带 ID。参与关系的任务应使用唯一 ID；插件能够为缺失或重复的
+ID 提供修复入口。
+
+## 使用要求
+
+- Obsidian `1.4.0` 或更高版本。
+- Tasks 插件：查看和解析地图时不是必需项；使用 Tasks 表单创建、编辑任务及切换状态时需要安装并启用。
+- 桌面端和移动端均未在清单中设为排除，但当前主要开发与验证环境是 Obsidian 桌面端。
+
+## 从源码安装
+
+克隆仓库并安装依赖：
+
+```bash
+git clone https://github.com/AForAaron/task-graph-obsidian.git
+cd task-graph-obsidian
+npm install
+npm run build
+```
+
+将以下三个文件复制到 Vault 的插件目录：
+
+```text
+main.js
+manifest.json
+styles.css
+```
+
+目标路径：
+
+```text
+<vault>/.obsidian/plugins/task-graph/
+```
+
+然后重新加载 Obsidian，在“设置 → 第三方插件”中启用 **Task Graph**。可通过左侧 ribbon
+图标或命令面板中的“打开项目任务图”进入插件。
+
+## 基本工作流
+
+1. 新建或选择一张任务地图。
+2. 点击“来源”，勾选需要纳入地图的 Markdown 文件或文件夹。
+3. 在左侧文件树中选择当前文件，或直接在画布空白处右键创建任务。
+4. 从节点右侧连接点拖到另一节点以建立“前置 → 后续”关系；拖到空白处则创建后续任务。
+5. 从节点左侧连接点拖到另一节点或空白处，可建立或创建前置任务。
+6. 拖动节点调整位置；需要恢复依赖布局时点击“规整”。
+
+删除地图只会移除该地图保存的来源、布局和视口，不会删除笔记。删除任务或修改关系会直接写回
+Markdown，执行前请确认提示内容。
+
+## 项目结构
+
+```text
+src/
+├── components/       # 画布、节点交互和弹窗
+├── layout/           # 从左到右的分层布局
+├── model/            # 任务、依赖、地图和视口模型
+├── services/         # 解析、构图、来源解析、Tasks API 与安全写回
+├── styles/           # Obsidian 主题适配样式
+├── views/            # Task Graph 主视图
+└── main.ts           # 插件入口
+```
+
+主要设计说明见 [`DESIGN.md`](./DESIGN.md)，当前实现上下文和验证记录见
+[`PROJECT_CONTEXT.md`](./PROJECT_CONTEXT.md)。
 
 ## 开发
 
 ```bash
 npm install
+npm run dev
+```
+
+生产构建：
+
+```bash
 npm run build
 ```
 
-将 `main.js`、`manifest.json` 和 `styles.css` 复制到：
+构建会执行 TypeScript 类型检查，生成 `main.js`，并把 `src/styles/main.css` 复制为
+`styles.css`。这些生成文件默认不提交到源码仓库。
 
-```text
-<vault>/.obsidian/plugins/task-graph/
-```
+## 当前边界
+
+- 只解析 Markdown inline checkbox task，不支持 note-as-task。
+- 只有 `🆔` / `⛔` 会形成正式依赖边；Markdown 缩进不等同于阻塞关系。
+- 尚无 Markdown 嵌入图、批量编辑、关键路径或工期预测。
+- 当前 smoke test 是仓库内的开发验证脚本，尚未接入标准测试框架和 `npm test`。
+- 插件会直接修改用户笔记；虽然跨文件关系写入包含失败回滚处理，仍建议保持 Vault 备份。
+
+## License
+
+项目元数据声明为 MIT。正式对外发布前仍需在仓库根目录补充 `LICENSE` 文件。

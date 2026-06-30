@@ -1,7 +1,7 @@
 {
 	"name": "task-graph",
 	"version": "0.3.3",
-	"description": "Project-focused task dependency graph for Obsidian",
+	"description": "Editable project dependency graphs for Obsidian Tasks",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
