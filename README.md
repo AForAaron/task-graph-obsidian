@@ -130,4 +130,4 @@ npm run build
 
 ## License
 
-项目元数据声明为 MIT。正式对外发布前仍需在仓库根目录补充 `LICENSE` 文件。
+本项目采用 [MIT License](./LICENSE)。
