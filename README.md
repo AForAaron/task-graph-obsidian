@@ -4,7 +4,7 @@ Task Graph 是一款面向 Obsidian 的可编辑任务依赖图插件。它把 M
 [Obsidian Tasks](https://github.com/obsidian-tasks-group/obsidian-tasks) 任务组织成多张独立地图，
 帮助你看清任务之间的前置关系、当前阻塞和下一步行动。
 
-> 当前版本：`0.3.3`。项目仍处于早期开发阶段，建议先在测试 Vault 或已备份的笔记中使用写入功能。
+> 当前版本：`0.4.0`。项目仍处于早期开发阶段，建议先在测试 Vault 或已备份的笔记中使用写入功能。
 
 ## 核心能力
 
@@ -20,6 +20,8 @@ Task Graph 是一款面向 Obsidian 的可编辑任务依赖图插件。它把 M
 - 在图中创建、编辑、删除任务，以及添加前置或后续任务。
 - 拖动节点连接点建立依赖；点击依赖线可确认解除关系。
 - 修改任务状态、标签和星标，并为关系任务生成或修复唯一 ID。
+- 创建或关联独立 Markdown 内容文件，并在画布中快速编辑、预览、重命名、重绑或删除。
+- 显示内容摘要、字数和清单进度，并允许一个内容文件关联多个任务。
 - 监听来源文件的创建、修改、删除和重命名并刷新地图。
 
 ## 任务关系格式
@@ -31,6 +33,7 @@ Task Graph 直接读取和写回 Markdown，不维护第二套任务数据库。
 - [ ] 项目规划 🆔 root001
 - [/] 设计界面 🆔 design01 ⛔ root001
 - [ ] 开发画布 🆔 canvas01 ⛔ root001,design01
+- [ ] 编写方案 🆔 plan001 📄 [[Projects/任务内容/plan001-编写方案|任务内容]]
 ```
 
 图中箭头方向为：
@@ -41,6 +44,9 @@ Task Graph 直接读取和写回 Markdown，不维护第二套任务数据库。
 
 没有参与依赖关系的任务可以不带 ID。参与关系的任务应使用唯一 ID；插件能够为缺失或重复的
 ID 提供修复入口。
+
+`📄` 后的 WikiLink 表示任务内容文件。插件兼容完整路径、相对路径和短 WikiLink；解除、重命名或
+重绑时会按 Obsidian 实际解析到的文件匹配。
 
 ## 使用要求
 
@@ -55,8 +61,8 @@ ID 提供修复入口。
 ```bash
 git clone https://github.com/AForAaron/task-graph-obsidian.git
 cd task-graph-obsidian
-npm install
-npm run build
+corepack pnpm install --frozen-lockfile
+corepack pnpm run build
 ```
 
 将以下三个文件复制到 Vault 的插件目录：
@@ -84,6 +90,8 @@ styles.css
 4. 从节点右侧连接点拖到另一节点以建立“前置 → 后续”关系；拖到空白处则创建后续任务。
 5. 从节点左侧连接点拖到另一节点或空白处，可建立或创建前置任务。
 6. 拖动节点调整位置；需要恢复依赖布局时点击“规整”。
+7. 从任务底部的内容连接点拖到空白处创建内容，或拖到已有内容卡建立关联。
+8. 在右侧详情中快速编辑内容；检测到外部修改冲突时，插件会停止覆盖。
 
 删除地图只会移除该地图保存的来源、布局和视口，不会删除笔记。删除任务或修改关系会直接写回
 Markdown，执行前请确认提示内容。
@@ -107,17 +115,23 @@ src/
 ## 开发
 
 ```bash
-npm install
-npm run dev
+corepack pnpm install --frozen-lockfile
+corepack pnpm run dev
 ```
 
-生产构建：
+测试、类型检查和生产构建：
 
 ```bash
+npm test
 npm run build
+npm run check
 ```
 
-构建会执行 TypeScript 类型检查，生成 `main.js`，并把 `src/styles/main.css` 复制为
+使用 pnpm 时，以上命令可等价替换为 `corepack pnpm test`、`corepack pnpm run build` 和
+`corepack pnpm run check`。测试运行器会自动发现 `tests/smoke.ts` 和 `tests/*.test.ts`，
+在系统临时目录中编译、执行并清理测试产物。
+
+构建会对源码和 TypeScript 测试执行类型检查，生成 `main.js`，并把 `src/styles/main.css` 复制为
 `styles.css`。这些生成文件默认不提交到源码仓库。
 
 ## 当前边界
@@ -125,7 +139,8 @@ npm run build
 - 只解析 Markdown inline checkbox task，不支持 note-as-task。
 - 只有 `🆔` / `⛔` 会形成正式依赖边；Markdown 缩进不等同于阻塞关系。
 - 尚无 Markdown 嵌入图、批量编辑、关键路径或工期预测。
-- 当前 smoke test 是仓库内的开发验证脚本，尚未接入标准测试框架和 `npm test`。
+- 自定义 checkbox 标记会作为“自定义状态”进入地图；完成切换仍由 Tasks 插件解释。
+- 当前测试是可重复执行的核心 smoke test，尚未引入完整 UI 自动化与真实 Vault 集成测试。
 - 插件会直接修改用户笔记；虽然跨文件关系写入包含失败回滚处理，仍建议保持 Vault 备份。
 
 ## License

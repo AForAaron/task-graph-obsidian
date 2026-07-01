@@ -1,18 +1,24 @@
 {
 	"name": "task-graph",
-	"version": "0.3.3",
+	"version": "0.4.0",
+	"packageManager": "pnpm@11.7.0",
 	"description": "Editable project dependency graphs for Obsidian Tasks",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
-		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"test": "node tests/run.mjs",
+		"check": "node tests/run.mjs && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+	},
+	"engines": {
+		"node": ">=16"
 	},
 	"license": "MIT",
 	"devDependencies": {
-		"@types/node": "^16.11.6",
+		"@types/node": "16.18.126",
 		"builtin-modules": "3.3.0",
 		"esbuild": "0.17.3",
-		"obsidian": "latest",
+		"obsidian": "1.11.4",
 		"tslib": "2.4.0",
 		"typescript": "4.7.4"
 	}

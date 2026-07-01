@@ -1,14 +1,22 @@
 import { Menu, setIcon } from 'obsidian';
 import {
+	DocumentEdge,
 	NodePosition,
+	PositionedDocumentNode,
+	PositionedGraphNode,
 	PositionedTaskNode,
 	TaskEdge,
 	ViewportState,
 } from '../model/TaskGraphModel';
-import { LayoutResult } from '../layout/LayeredLayout';
+
+export interface CanvasLayout {
+	nodes: PositionedGraphNode[];
+	width: number;
+	height: number;
+}
 
 interface GraphCanvasOptions {
-	onSelect: (node: PositionedTaskNode) => void;
+	onSelect: (node: PositionedGraphNode) => void;
 	onOpen: (node: PositionedTaskNode) => void;
 	onToggle: (node: PositionedTaskNode) => void;
 	onEdit: (node: PositionedTaskNode) => void;
@@ -18,9 +26,15 @@ interface GraphCanvasOptions {
 	onRemoveRelationship: (parent: PositionedTaskNode, child: PositionedTaskNode) => void;
 	onDelete: (node: PositionedTaskNode) => void;
 	onToggleStar: (node: PositionedTaskNode) => void;
-	onNodeMove: (node: PositionedTaskNode, position: NodePosition) => void;
+	onNodeMove: (node: PositionedGraphNode, position: NodePosition) => void;
 	onViewportChange: (viewport: ViewportState) => void;
 	onCreateAt: (position: NodePosition) => void;
+	onCreateDocumentAt: (position: NodePosition) => void;
+	onCreateDocumentForTask: (node: PositionedTaskNode, position?: NodePosition) => void;
+	onLinkDocument: (node: PositionedTaskNode, document: PositionedDocumentNode) => void;
+	onOpenDocument: (document: PositionedDocumentNode) => void;
+	onEditDocument: (document: PositionedDocumentNode) => void;
+	onRemoveDocument: (document: PositionedDocumentNode) => void;
 }
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -48,19 +62,24 @@ function fileName(path: string): string {
 	return value.replace(/\.md$/i, '');
 }
 
+function isDocumentNode(node: PositionedGraphNode): node is PositionedDocumentNode {
+	return 'nodeType' in node && node.nodeType === 'document';
+}
+
 export class GraphCanvas {
 	private readonly hostEl: HTMLElement;
 	private readonly viewportEl: HTMLElement;
 	private readonly worldEl: HTMLElement;
 	private readonly options: GraphCanvasOptions;
 	private viewport: ViewportState = { x: 24, y: 24, scale: 1 };
-	private layout: LayoutResult = { nodes: [], width: 0, height: 0 };
+	private layout: CanvasLayout = { nodes: [], width: 0, height: 0 };
 	private edges: TaskEdge[] = [];
+	private documentEdges: DocumentEdge[] = [];
 	private selectedId: string | null = null;
 	private isPanning = false;
 	private panMoved = false;
 	private panStart = { x: 0, y: 0, viewportX: 0, viewportY: 0 };
-	private draggingNode: PositionedTaskNode | null = null;
+	private draggingNode: PositionedGraphNode | null = null;
 	private dragCard: HTMLElement | null = null;
 	private dragMoved = false;
 	private dragStart = { x: 0, y: 0, nodeX: 0, nodeY: 0 };
@@ -69,7 +88,7 @@ export class GraphCanvas {
 	private connectionPath: SVGPathElement | null = null;
 	private connectionMoved = false;
 	private connectionStart = { x: 0, y: 0 };
-	private connectionHandle: 'source' | 'target' = 'source';
+	private connectionHandle: 'source' | 'target' | 'document' = 'source';
 
 	constructor(hostEl: HTMLElement, options: GraphCanvasOptions) {
 		this.hostEl = hostEl;
@@ -93,9 +112,15 @@ export class GraphCanvas {
 		window.removeEventListener('pointerup', this.handlePointerUp);
 	}
 
-	render(layout: LayoutResult, edges: TaskEdge[], selectedId: string | null): void {
+	render(
+		layout: CanvasLayout,
+		edges: TaskEdge[],
+		documentEdges: DocumentEdge[],
+		selectedId: string | null,
+	): void {
 		this.layout = layout;
 		this.edges = edges;
+		this.documentEdges = documentEdges;
 		this.selectedId = selectedId;
 		this.worldEl.empty();
 		this.updateWorldSize();
@@ -296,8 +321,12 @@ export class GraphCanvas {
 			const shouldCreate = releasedInsideCanvas && !releasedOnPanel && !releasedNode;
 			this.finishConnection();
 			if (releasedNode && releasedNode.id !== source.id) {
-				if (handle === 'source') this.options.onConnect(source, releasedNode);
-				else this.options.onConnect(releasedNode, source);
+				if (handle === 'document' && isDocumentNode(releasedNode)) {
+					this.options.onLinkDocument(source, releasedNode);
+				} else if (!isDocumentNode(releasedNode)) {
+					if (handle === 'source') this.options.onConnect(source, releasedNode);
+					else if (handle === 'target') this.options.onConnect(releasedNode, source);
+				}
 			} else if (shouldCreate) {
 				const position = this.connectionMoved
 					? {
@@ -306,7 +335,8 @@ export class GraphCanvas {
 					}
 					: undefined;
 				if (handle === 'source') this.options.onCreateSuccessor(source, position);
-				else this.options.onCreatePredecessor(source, position);
+				else if (handle === 'target') this.options.onCreatePredecessor(source, position);
+				else this.options.onCreateDocumentForTask(source, position);
 			}
 			return;
 		}
@@ -337,7 +367,7 @@ export class GraphCanvas {
 		event: PointerEvent,
 		node: PositionedTaskNode,
 		card: HTMLElement,
-		handle: 'source' | 'target',
+		handle: 'source' | 'target' | 'document',
 	): void {
 		if (event.button !== 0) return;
 		event.preventDefault();
@@ -350,14 +380,19 @@ export class GraphCanvas {
 		card.addClass('is-connecting');
 		this.hostEl.addClass(
 			'is-connecting',
-			handle === 'source' ? 'is-connecting-forward' : 'is-connecting-backward',
+			handle === 'source'
+				? 'is-connecting-forward'
+				: handle === 'target'
+					? 'is-connecting-backward'
+					: 'is-connecting-document',
 		);
 
 		const edgeLayer = this.worldEl.querySelector<SVGSVGElement>('.tgf-edge-layer');
 		if (!edgeLayer) return;
 		const path = document.createElementNS(SVG_NS, 'path');
 		path.addClass('tgf-edge', 'tgf-edge-preview');
-		path.setAttribute('marker-end', 'url(#tgf-arrow)');
+		if (handle !== 'document') path.setAttribute('marker-end', 'url(#tgf-arrow)');
+		else path.addClass('is-document');
 		edgeLayer.appendChild(path);
 		this.connectionPath = path;
 		this.updateConnectionPreview(this.clientToWorld(event.clientX, event.clientY));
@@ -366,11 +401,24 @@ export class GraphCanvas {
 	private updateConnectionPreview(target: NodePosition): void {
 		if (!this.connectionSource || !this.connectionPath) return;
 		const portOffset = 8;
-		const startX = this.connectionHandle === 'source'
-			? this.connectionSource.x + this.connectionSource.width + portOffset
-			: this.connectionSource.x - portOffset;
-		const startY = this.connectionSource.y + this.connectionSource.height / 2;
+		const documentHandle = this.connectionHandle === 'document';
+		const startX = documentHandle
+			? this.connectionSource.x + this.connectionSource.width / 2
+			: this.connectionHandle === 'source'
+				? this.connectionSource.x + this.connectionSource.width + portOffset
+				: this.connectionSource.x - portOffset;
+		const startY = documentHandle
+			? this.connectionSource.y + this.connectionSource.height + portOffset
+			: this.connectionSource.y + this.connectionSource.height / 2;
 		const distance = Math.max(52, Math.abs(target.x - startX) * 0.48);
+		if (documentHandle) {
+			const verticalDistance = Math.max(44, Math.abs(target.y - startY) * 0.5);
+			this.connectionPath.setAttribute(
+				'd',
+				`M ${startX} ${startY} C ${startX} ${startY + verticalDistance}, ${target.x} ${target.y - verticalDistance}, ${target.x} ${target.y}`,
+			);
+			return;
+		}
 		const direction = this.connectionHandle === 'source' ? 1 : -1;
 		this.connectionPath.setAttribute(
 			'd',
@@ -381,7 +429,12 @@ export class GraphCanvas {
 	private finishConnection(): void {
 		this.connectionPath?.remove();
 		this.connectionCard?.removeClass('is-connecting');
-		this.hostEl.removeClass('is-connecting', 'is-connecting-forward', 'is-connecting-backward');
+		this.hostEl.removeClass(
+			'is-connecting',
+			'is-connecting-forward',
+			'is-connecting-backward',
+			'is-connecting-document',
+		);
 		this.connectionSource = null;
 		this.connectionCard = null;
 		this.connectionPath = null;
@@ -395,12 +448,25 @@ export class GraphCanvas {
 		if (card) {
 			const node = this.layout.nodes.find((item) => item.id === card.dataset.nodeId);
 			if (!node) return;
+			if (isDocumentNode(node)) {
+				menu.addItem((item) => item.setTitle('快速编辑内容').setIcon('square-pen')
+					.onClick(() => this.options.onEditDocument(node)));
+				menu.addItem((item) => item.setTitle('打开完整笔记').setIcon('file-text')
+					.onClick(() => this.options.onOpenDocument(node)));
+				menu.addSeparator();
+				menu.addItem((item) => item.setTitle('从画布移除').setIcon('panel-bottom-close')
+					.onClick(() => this.options.onRemoveDocument(node)));
+				menu.showAtMouseEvent(event);
+				return;
+			}
 			menu.addItem((item) => item.setTitle('创建后续任务').setIcon('git-branch-plus')
 				.onClick(() => this.options.onCreateSuccessor(node)));
 			menu.addItem((item) => item.setTitle('创建前置任务').setIcon('git-branch')
 				.onClick(() => this.options.onCreatePredecessor(node)));
 			menu.addItem((item) => item.setTitle('编辑任务').setIcon('pencil')
 				.onClick(() => this.options.onEdit(node)));
+			menu.addItem((item) => item.setTitle('新建任务内容').setIcon('file-plus-2')
+				.onClick(() => this.options.onCreateDocumentForTask(node)));
 			menu.addItem((item) => item.setTitle(node.starred ? '取消星标' : '添加星标').setIcon('star')
 				.onClick(() => this.options.onToggleStar(node)));
 			menu.addItem((item) => item.setTitle('打开原文').setIcon('file-text')
@@ -416,6 +482,8 @@ export class GraphCanvas {
 			};
 			menu.addItem((item) => item.setTitle('新建任务').setIcon('plus')
 				.onClick(() => this.options.onCreateAt(position)));
+			menu.addItem((item) => item.setTitle('新建内容').setIcon('file-plus-2')
+				.onClick(() => this.options.onCreateDocumentAt(position)));
 		}
 		menu.showAtMouseEvent(event);
 	};
@@ -449,7 +517,7 @@ export class GraphCanvas {
 		this.edges.filter((edge) => !edge.missing).forEach((edge) => {
 			const source = nodeById.get(edge.sourceId);
 			const target = nodeById.get(edge.targetId);
-			if (!source || !target) return;
+			if (!source || !target || isDocumentNode(source) || isDocumentNode(target)) return;
 			const portOffset = 8;
 			const startX = source.x + source.width + portOffset;
 			const startY = source.y + source.height / 2;
@@ -466,6 +534,23 @@ export class GraphCanvas {
 			});
 			svg.appendChild(path);
 		});
+		this.documentEdges.forEach((edge) => {
+			const task = nodeById.get(edge.taskNodeId);
+			const documentNode = nodeById.get(edge.documentNodeId);
+			if (!task || !documentNode || isDocumentNode(task) || !isDocumentNode(documentNode)) return;
+			const startX = task.x + task.width / 2;
+			const startY = task.y + task.height + 8;
+			const endX = documentNode.x + documentNode.width / 2;
+			const endY = documentNode.y - 8;
+			const distance = Math.max(44, Math.abs(endY - startY) * 0.45);
+			const path = document.createElementNS(SVG_NS, 'path');
+			path.addClass('tgf-edge', 'tgf-document-edge');
+			path.setAttribute(
+				'd',
+				`M ${startX} ${startY} C ${startX} ${startY + distance}, ${endX} ${endY - distance}, ${endX} ${endY}`,
+			);
+			svg.appendChild(path);
+		});
 
 		this.worldEl.prepend(svg);
 	}
@@ -473,6 +558,10 @@ export class GraphCanvas {
 	private renderNodes(): void {
 		const layer = this.worldEl.createDiv('tgf-node-layer');
 		this.layout.nodes.forEach((node) => {
+			if (isDocumentNode(node)) {
+				this.renderDocumentNode(layer, node);
+				return;
+			}
 			const card = layer.createDiv({
 				cls: `tgf-node is-${node.readiness}${node.warnings.length > 0 ? ' has-warning' : ''}`,
 				attr: {
@@ -510,6 +599,22 @@ export class GraphCanvas {
 			});
 			outputHandle.addEventListener('pointerdown', (event) => this.startConnection(event, node, card, 'source'));
 			outputHandle.addEventListener('click', (event) => {
+				event.preventDefault();
+				event.stopPropagation();
+			});
+			const documentHandle = card.createEl('button', {
+				cls: 'tgf-node-document-handle',
+				attr: {
+					'aria-label': '拖动以创建或关联任务内容',
+					title: '拖动到空白处新建内容，或拖到内容卡建立关联',
+				},
+			});
+			setIcon(documentHandle, 'file-plus-2');
+			documentHandle.addEventListener(
+				'pointerdown',
+				(event) => this.startConnection(event, node, card, 'document'),
+			);
+			documentHandle.addEventListener('click', (event) => {
 				event.preventDefault();
 				event.stopPropagation();
 			});
@@ -576,6 +681,62 @@ export class GraphCanvas {
 			card.addEventListener('keydown', (event) => {
 				if (event.key === 'Enter') this.options.onOpen(node);
 			});
+		});
+	}
+
+	private renderDocumentNode(layer: HTMLElement, node: PositionedDocumentNode): void {
+		const card = layer.createDiv({
+			cls: `tgf-node tgf-document-node${node.missing ? ' is-missing' : ''}`,
+			attr: {
+				'data-node-id': node.id,
+				tabindex: '0',
+				'aria-label': node.title,
+			},
+		});
+		if (node.id === this.selectedId) card.addClass('is-selected');
+		card.style.left = `${node.x}px`;
+		card.style.top = `${node.y}px`;
+		card.style.width = `${node.width}px`;
+		card.style.height = `${node.height}px`;
+		const heading = card.createDiv('tgf-document-heading');
+		const icon = heading.createSpan('tgf-document-icon');
+		setIcon(icon, node.missing ? 'file-warning' : 'file-text');
+		heading.createDiv({
+			cls: 'tgf-node-title',
+			text: node.title,
+			attr: { title: node.title },
+		});
+		if (node.excerpt) card.createDiv({ cls: 'tgf-document-excerpt', text: node.excerpt });
+		const footer = card.createDiv('tgf-node-footer');
+		const progress = node.checklistTotal > 0
+			? `${node.checklistDone}/${node.checklistTotal} 清单`
+			: `${node.wordCount} 字`;
+		footer.createSpan({
+			cls: `tgf-document-stat${node.missing ? ' is-warning' : ''}`,
+			text: node.missing ? '内容文件缺失' : progress,
+		});
+		footer.createSpan({ cls: 'tgf-document-stat', text: `${node.linkedTaskIds.length} 个任务` });
+		const actions = footer.createDiv('tgf-node-quick-actions');
+		const edit = actions.createEl('button', { attr: { title: '快速编辑内容' } });
+		setIcon(edit, 'square-pen');
+		edit.addEventListener('click', (event) => {
+			event.stopPropagation();
+			this.options.onEditDocument(node);
+		});
+		const open = actions.createEl('button', { attr: { title: '打开完整笔记' } });
+		setIcon(open, 'external-link');
+		open.addEventListener('click', (event) => {
+			event.stopPropagation();
+			this.options.onOpenDocument(node);
+		});
+		card.addEventListener('click', () => {
+			if (!this.dragMoved) this.options.onSelect(node);
+		});
+		card.addEventListener('dblclick', () => {
+			if (!this.dragMoved) this.options.onOpenDocument(node);
+		});
+		card.addEventListener('keydown', (event) => {
+			if (event.key === 'Enter') this.options.onOpenDocument(node);
 		});
 	}
 }

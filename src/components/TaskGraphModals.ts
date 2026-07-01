@@ -1,5 +1,6 @@
 import {
 	App,
+	FuzzySuggestModal,
 	Modal,
 	normalizePath,
 	Setting,
@@ -142,6 +143,45 @@ export function requestTextValue(
 			}
 		}
 		new TextValueModal(app).open();
+	});
+}
+
+export function chooseMarkdownFile(
+	app: App,
+	title: string,
+	excludedPaths = new Set<string>(),
+): Promise<TFile | null> {
+	return new Promise((resolve) => {
+		class MarkdownFileModal extends FuzzySuggestModal<TFile> {
+			private resolved = false;
+
+			onOpen(): void {
+				super.onOpen();
+				this.setPlaceholder('搜索 Markdown 文件');
+				this.titleEl.setText(title);
+			}
+
+			getItems(): TFile[] {
+				return app.vault.getMarkdownFiles()
+					.filter((file) => !excludedPaths.has(file.path))
+					.sort((a, b) => a.path.localeCompare(b.path, 'zh-CN'));
+			}
+
+			getItemText(file: TFile): string {
+				return file.path;
+			}
+
+			onChooseItem(file: TFile): void {
+				this.resolved = true;
+				resolve(file);
+			}
+
+			onClose(): void {
+				super.onClose();
+				if (!this.resolved) resolve(null);
+			}
+		}
+		new MarkdownFileModal(app).open();
 	});
 }
 

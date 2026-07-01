@@ -2143,7 +2143,8 @@
 }
 
 .tgf-status-pill.is-active,
-.tgf-status-pill.is-in_progress {
+.tgf-status-pill.is-in_progress,
+.tgf-status-pill.is-custom {
 	background: rgba(214, 162, 58, 0.12);
 	color: #d6a23a;
 }
@@ -2236,4 +2237,328 @@
 
 .tgf-edge {
 	stroke-linecap: round;
+}
+
+/* Document nodes extend the existing card language without changing task cards. */
+.tgf-node-document-handle {
+	position: absolute;
+	bottom: 4px;
+	left: 50%;
+	z-index: 5;
+	display: grid;
+	place-items: center;
+	width: 28px;
+	height: 22px;
+	min-width: 28px;
+	margin: 0;
+	padding: 0;
+	border: 1px solid color-mix(in srgb, var(--tgf-accent) 45%, var(--tgf-border));
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--tgf-panel) 94%, var(--tgf-accent));
+	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.24);
+	color: color-mix(in srgb, var(--tgf-accent) 82%, white);
+	opacity: 0;
+	transform: translateX(-50%);
+	transition: opacity 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.tgf-node-document-handle svg {
+	width: 13px;
+	height: 13px;
+}
+
+.tgf-node:hover .tgf-node-document-handle,
+.tgf-node:focus-within .tgf-node-document-handle,
+.tgf-node.is-connecting .tgf-node-document-handle {
+	opacity: 1;
+}
+
+.tgf-node-document-handle:hover,
+.tgf-canvas.is-connecting-document .tgf-node.is-connecting .tgf-node-document-handle {
+	background: var(--tgf-accent);
+	color: white;
+	transform: translateX(-50%) translateY(-2px);
+}
+
+.tgf-document-node {
+	/* Document cards do not have side ports, so clip their own text safely. */
+	overflow: hidden;
+	border-color: color-mix(in srgb, #48a9a6 42%, var(--tgf-border));
+	background:
+		linear-gradient(
+			180deg,
+			color-mix(in srgb, var(--tgf-panel) 95%, #214744),
+			color-mix(in srgb, var(--tgf-panel) 98%, #172c2b)
+		);
+}
+
+.tgf-document-node.is-missing {
+	border-color: color-mix(in srgb, var(--text-error) 55%, var(--tgf-border));
+	border-style: dashed;
+}
+
+.tgf-document-heading {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: flex-start;
+	gap: 8px;
+	box-sizing: border-box;
+	width: 100%;
+	max-width: 100%;
+	min-width: 0;
+	overflow: hidden;
+}
+
+.tgf-document-heading .tgf-node-title {
+	display: block;
+	flex: 1 1 0;
+	width: 0;
+	max-width: 100%;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	overflow-wrap: normal;
+	word-break: normal;
+	-webkit-line-clamp: initial;
+}
+
+.tgf-document-icon {
+	display: grid;
+	flex: 0 0 24px;
+	place-items: center;
+	width: 24px;
+	height: 24px;
+	border-radius: 7px;
+	background: rgba(72, 169, 166, 0.12);
+	color: #64bbb8;
+}
+
+.tgf-document-icon svg {
+	width: 14px;
+	height: 14px;
+}
+
+.tgf-document-excerpt {
+	display: -webkit-box;
+	width: 100%;
+	max-width: 100%;
+	min-height: 29px;
+	overflow: hidden;
+	overflow-wrap: anywhere;
+	word-break: break-word;
+	color: var(--tgf-muted);
+	font-size: 9.5px;
+	line-height: 1.45;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+}
+
+.tgf-document-stat {
+	min-width: 0;
+	overflow: hidden;
+	color: var(--tgf-muted);
+	font-size: 9px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.tgf-document-node .tgf-node-footer {
+	width: 100%;
+	max-width: 100%;
+	overflow: hidden;
+}
+
+.tgf-document-node .tgf-node-footer > .tgf-document-stat {
+	flex: 0 1 auto;
+}
+
+.tgf-document-node .tgf-node-footer > .tgf-document-stat:first-child {
+	flex: 1 1 auto;
+}
+
+.tgf-document-node .tgf-node-footer .tgf-node-quick-actions {
+	flex: 0 0 auto;
+}
+
+.tgf-document-stat.is-warning {
+	color: var(--text-error);
+}
+
+.tgf-document-edge,
+.tgf-edge-preview.is-document {
+	stroke: color-mix(in srgb, #64bbb8 72%, transparent);
+	stroke-width: 1.5;
+	stroke-dasharray: 5 5;
+}
+
+.tgf-section-heading,
+.tgf-section-actions,
+.tgf-linked-document,
+.tgf-linked-document-main {
+	display: flex;
+	align-items: center;
+	min-width: 0;
+}
+
+.tgf-section-heading {
+	justify-content: space-between;
+	gap: 8px;
+}
+
+.tgf-section-actions {
+	gap: 4px;
+}
+
+.tgf-section-actions button {
+	min-height: 24px;
+	padding: 2px 7px;
+	font-size: 9px;
+}
+
+.tgf-section-actions button.is-active {
+	background: color-mix(in srgb, var(--tgf-accent) 24%, transparent);
+	color: var(--tgf-text);
+}
+
+.tgf-linked-document-list {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+	margin-top: 7px;
+}
+
+.tgf-linked-document {
+	gap: 5px;
+}
+
+.tgf-linked-document-main {
+	flex: 1 1 auto;
+	justify-content: flex-start;
+	gap: 7px;
+	width: 0;
+	max-width: 100%;
+	min-height: 30px;
+	overflow: hidden;
+}
+
+.tgf-linked-document-main span:last-child {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.tgf-linked-document-main svg,
+.tgf-linked-document-unlink svg {
+	width: 13px;
+	height: 13px;
+}
+
+.tgf-linked-document-unlink {
+	flex: 0 0 30px;
+	width: 30px;
+	height: 30px;
+	padding: 0;
+}
+
+.tgf-editor-status {
+	margin: 6px 0;
+	color: var(--tgf-muted);
+	font-size: 9px;
+}
+
+.tgf-document-editor {
+	box-sizing: border-box;
+	min-height: 240px;
+	width: 100%;
+	padding: 10px;
+	resize: vertical;
+	font-family: var(--font-monospace);
+	font-size: 11px;
+	line-height: 1.55;
+}
+
+.tgf-document-preview {
+	min-height: 180px;
+	padding: 6px 2px;
+	overflow-wrap: anywhere;
+	font-size: 11px;
+}
+
+.tgf-document-task-search {
+	box-sizing: border-box;
+	width: 100%;
+	margin: 7px 0;
+}
+
+.tgf-document-task-list {
+	display: flex;
+	flex-direction: column;
+	max-height: 190px;
+	overflow: auto;
+}
+
+.tgf-document-task-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	max-width: 100%;
+	min-width: 0;
+	min-height: 30px;
+	padding: 4px;
+	overflow: hidden;
+	border-radius: 5px;
+	font-size: 10px;
+}
+
+.tgf-document-task-row input {
+	flex: 0 0 auto;
+}
+
+.tgf-document-task-row:hover {
+	background: var(--background-modifier-hover);
+}
+
+.tgf-document-task-row span {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.tgf-source-documents {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin-top: 10px;
+	padding-top: 9px;
+	border-top: 1px solid var(--tgf-border);
+}
+
+.tgf-source-document {
+	box-sizing: border-box;
+	width: 100%;
+	max-width: 100%;
+	min-width: 0;
+	min-height: 26px;
+	margin: 0;
+	padding: 4px 7px;
+	overflow: hidden;
+	border: 0;
+	background: transparent;
+	box-shadow: none;
+	color: var(--tgf-muted);
+	font-size: 9px;
+	text-align: left;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.tgf-source-document:hover {
+	background: var(--background-modifier-hover);
+	color: var(--tgf-text);
 }

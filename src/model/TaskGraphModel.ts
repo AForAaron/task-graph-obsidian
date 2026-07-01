@@ -1,4 +1,4 @@
-export type TaskStatus = 'todo' | 'in_progress' | 'done' | 'canceled';
+export type TaskStatus = 'todo' | 'in_progress' | 'done' | 'canceled' | 'custom';
 export type TaskPriority = 'highest' | 'high' | 'medium' | 'low' | 'lowest';
 export type TaskReadiness = 'ready' | 'blocked' | 'active' | 'finished';
 export type TaskWarning = 'missing-id' | 'duplicate-id' | 'missing-reference' | 'cycle';
@@ -12,6 +12,7 @@ export interface TaskNode {
 	text: string;
 	rawBody: string;
 	status: TaskStatus;
+	statusMarker: string;
 	path: string;
 	line: number;
 	headingPath: string[];
@@ -24,6 +25,7 @@ export interface TaskNode {
 	dueDate?: string;
 	completionDate?: string;
 	starred: boolean;
+	documentLinks: string[];
 }
 
 export interface TaskEdge {
@@ -53,6 +55,36 @@ export interface PositionedTaskNode extends DerivedTaskNode {
 	layer: number;
 }
 
+export interface DocumentNode {
+	id: string;
+	nodeType: 'document';
+	path: string;
+	title: string;
+	excerpt: string;
+	wordCount: number;
+	checklistDone: number;
+	checklistTotal: number;
+	mtime: number;
+	linkedTaskIds: string[];
+	missing: boolean;
+}
+
+export interface PositionedDocumentNode extends DocumentNode {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	layer: number;
+}
+
+export type PositionedGraphNode = PositionedTaskNode | PositionedDocumentNode;
+
+export interface DocumentEdge {
+	id: string;
+	taskNodeId: string;
+	documentNodeId: string;
+}
+
 export interface NodePosition {
 	x: number;
 	y: number;
@@ -68,16 +100,22 @@ export type MapSource =
 	| { type: 'file'; path: string }
 	| { type: 'folder'; path: string; recursive: true };
 
+export interface MapDocumentConfig {
+	path: string;
+	expanded: boolean;
+}
+
 export interface TaskMapConfig {
 	id: string;
 	name: string;
 	sources: MapSource[];
 	nodePositions: Record<string, NodePosition>;
 	viewport: ViewportState;
+	documents: MapDocumentConfig[];
 }
 
 export interface TaskGraphPluginData {
-	version: 2;
+	version: 3;
 	maps: TaskMapConfig[];
 	activeMapId: string;
 	showCompleted: boolean;
@@ -93,13 +131,14 @@ export function createTaskMap(name = '我的任务地图', sources: MapSource[] 
 		sources,
 		nodePositions: {},
 		viewport: { ...DEFAULT_VIEWPORT },
+		documents: [],
 	};
 }
 
 const initialMap = createTaskMap();
 
 export const DEFAULT_PLUGIN_DATA: TaskGraphPluginData = {
-	version: 2,
+	version: 3,
 	maps: [initialMap],
 	activeMapId: initialMap.id,
 	showCompleted: true,

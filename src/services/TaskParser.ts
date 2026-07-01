@@ -1,9 +1,21 @@
 import { TaskNode, TaskPriority, TaskStatus, TaskWarning } from '../model/TaskGraphModel';
 
-const TASK_LINE_REGEX = /^(\s*(?:>\s*)*(?:[-*+]|\d+\.)\s+\[([ xX/\-])\]\s+)(.*)$/;
+const TASK_LINE_REGEX = /^(\s*(?:>\s*)*(?:[-*+]|\d+\.)\s+\[([^\]\r\n])\]\s+)(.*)$/;
 const ID_REGEX = /🆔\s*([A-Za-z0-9_-]+)/;
 const BLOCKED_BY_REGEX = /⛔\s*([A-Za-z0-9_-]+(?:\s*,\s*[A-Za-z0-9_-]+)*)/g;
 const TAG_REGEX = /(?:^|\s)#([\p{L}\p{N}_/-]+)/gu;
+const DOCUMENT_LINK_REGEX = /(?:^|\s)📄\s*\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]*)?\]\]/gu;
+
+export function normalizeDocumentPath(path: string): string {
+	const trimmed = path.trim().replace(/^\/+/, '');
+	return /\.md$/i.test(trimmed) ? trimmed : `${trimmed}.md`;
+}
+
+export function readDocumentLinks(body: string): string[] {
+	return Array.from(new Set(
+		Array.from(body.matchAll(DOCUMENT_LINK_REGEX), (match) => normalizeDocumentPath(match[1])),
+	));
+}
 
 export function hashText(value: string): string {
 	let hash = 2166136261;
@@ -34,7 +46,7 @@ function parseStatus(marker: string): TaskStatus {
 	if (marker === '-') {
 		return 'canceled';
 	}
-	return 'todo';
+	return marker === ' ' ? 'todo' : 'custom';
 }
 
 function parsePriority(body: string): TaskPriority | undefined {
@@ -55,10 +67,11 @@ function cleanTaskText(body: string): string {
 	return body
 		.replace(/🆔\s*[A-Za-z0-9_-]+/g, '')
 		.replace(/⛔\s*[A-Za-z0-9_-]+(?:\s*,\s*[A-Za-z0-9_-]+)*/g, '')
-		.replace(/[➕🛫⏳📅✅❌]\s*\d{4}-\d{2}-\d{2}/g, '')
-		.replace(/[⏫🔼🔺🔽⏬]/g, '')
+		.replace(/(?:➕|🛫|⏳|📅|✅|❌)\s*\d{4}-\d{2}-\d{2}/gu, '')
+		.replace(/(?:⏫|🔼|🔺|🔽|⏬)/gu, '')
 		.replace(/(?:^|\s)⭐(?:\s|$)/gu, ' ')
 		.replace(/(?:^|\s)#[\p{L}\p{N}_/-]+/gu, ' ')
+		.replace(DOCUMENT_LINK_REGEX, ' ')
 		.replace(/\s{2,}/g, ' ')
 		.trim();
 }
@@ -106,6 +119,7 @@ export function parseTaskFile(path: string, content: string): TaskNode[] {
 			text: cleanTaskText(body),
 			rawBody: body,
 			status: parseStatus(marker),
+			statusMarker: marker,
 			path,
 			line,
 			headingPath: headings.map((heading) => heading.text),
@@ -118,6 +132,7 @@ export function parseTaskFile(path: string, content: string): TaskNode[] {
 			dueDate: readDate(body, '📅'),
 			completionDate: readDate(body, '✅'),
 			starred: /(?:^|\s)⭐(?:\s|$)/u.test(body),
+			documentLinks: readDocumentLinks(body),
 		});
 	});
 

@@ -1,5 +1,6 @@
 import {
 	ItemView,
+	MarkdownRenderer,
 	MarkdownView,
 	Notice,
 	TAbstractFile,
@@ -9,7 +10,9 @@ import {
 } from 'obsidian';
 import TaskGraphPlugin from '../main';
 import { GraphCanvas } from '../components/GraphCanvas';
+import { CanvasLayout } from '../components/GraphCanvas';
 import {
+	chooseMarkdownFile,
 	chooseTaskTarget,
 	confirmAction,
 	openSourcePicker,
@@ -20,9 +23,13 @@ import {
 } from '../components/TaskGraphModals';
 import {
 	DerivedTaskNode,
+	DocumentEdge,
+	DocumentNode,
 	MapSource,
 	NodePosition,
 	PositionedTaskNode,
+	PositionedDocumentNode,
+	PositionedGraphNode,
 	TaskGraphData,
 	TaskMapConfig,
 	TaskNode,
@@ -33,6 +40,7 @@ import {
 import { parseTaskFile, taskPositionKey } from '../services/TaskParser';
 import { buildTaskGraph } from '../services/GraphBuilder';
 import { LayoutResult, layoutGraph } from '../layout/LayeredLayout';
+import { layoutTaskDocuments } from '../layout/DocumentLayout';
 import {
 	mapContainsPath,
 	resolveMapSources,
@@ -45,6 +53,8 @@ import {
 	appendTaskLine,
 	assignTaskId,
 	changeTaskTag,
+	changeTaskDocumentLink,
+	changeTaskDocumentLinks,
 	connectTasks,
 	createPredecessorTask,
 	createSuccessorTask,
@@ -57,8 +67,25 @@ import {
 	removeTaskRelationship,
 	repairTaskIds,
 	replaceTaskLine,
+	renameTaskDocumentLinks,
 	setTaskStar,
 } from '../services/TaskWriter';
+import {
+	buildDocumentEdges,
+	calculateDocumentStats,
+	collectDocumentPaths,
+	contentFolderForFile,
+	createContentDocument,
+	documentPositionKey,
+	loadDocumentNodes,
+	moveContentDocumentBesideTask,
+	registerDocument,
+	removeRegisteredDocument,
+	replaceRegisteredDocumentPath,
+	resolveDocumentPath,
+	sanitizeDocumentTitle,
+	uniqueDocumentPath,
+} from '../services/ContentDocuments';
 
 export const TASK_GRAPH_VIEW = 'task-graph-view';
 
@@ -67,6 +94,7 @@ const STATUS_LABELS: Record<TaskStatus, string> = {
 	in_progress: '进行中',
 	done: '已完成',
 	canceled: '已取消',
+	custom: '自定义',
 };
 
 export class TaskGraphView extends ItemView {
@@ -85,15 +113,27 @@ export class TaskGraphView extends ItemView {
 	private collapseButton: HTMLButtonElement;
 	private taskCache = new Map<string, TaskNode[]>();
 	private graphData: TaskGraphData = { nodes: [], edges: [] };
+	private documentNodes: DocumentNode[] = [];
+	private documentEdges: DocumentEdge[] = [];
+	private documentLinkAliases = new Map<string, Map<string, string[]>>();
 	private currentFilePath = '';
 	private selectedId: string | null = null;
 	private searchQuery = '';
 	private sourceQuery = '';
-	private enabledStatuses = new Set<TaskStatus>(['todo', 'in_progress', 'done', 'canceled']);
+	private enabledStatuses = new Set<TaskStatus>(['todo', 'in_progress', 'done', 'canceled', 'custom']);
 	private refreshTimer: number | null = null;
 	private saveTimer: number | null = null;
 	private shouldFitAfterRender = false;
 	private expandedSourceFolders = new Set<string>();
+	private documentSaveTimer: number | null = null;
+	private editorDocumentPath = '';
+	private editorLoadedMtime = 0;
+	private editorDirty = false;
+	private editorValue = '';
+	private ignoreDocumentModifyUntil = 0;
+	private editorLoadGeneration = 0;
+	private documentSavePromise: Promise<void> | null = null;
+	private reloadGeneration = 0;
 
 	constructor(leaf: WorkspaceLeaf, plugin: TaskGraphPlugin) {
 		super(leaf);
@@ -117,6 +157,9 @@ export class TaskGraphView extends ItemView {
 	}
 
 	async onOpen(): Promise<void> {
+		if (!this.plugin.data.showCompleted) {
+			this.enabledStatuses.delete('done');
+		}
 		this.contentEl.empty();
 		this.contentEl.addClass('tgf-container');
 		this.toolbarEl = this.contentEl.createDiv('tgf-toolbar');
@@ -129,7 +172,7 @@ export class TaskGraphView extends ItemView {
 		this.buildToolbar();
 		this.buildSourcePanel();
 		this.graphCanvas = new GraphCanvas(canvasHost, {
-			onSelect: (node) => this.selectNode(node),
+				onSelect: (node) => void this.selectGraphNode(node),
 			onOpen: (node) => void this.openTask(node),
 			onToggle: (node) => void this.toggleTask(node),
 			onEdit: (node) => void this.editTask(node),
@@ -142,9 +185,31 @@ export class TaskGraphView extends ItemView {
 			onNodeMove: (node, position) => this.saveNodePosition(node, position),
 			onViewportChange: (viewport) => this.saveViewport(viewport),
 			onCreateAt: (position) => void this.createTask(undefined, position),
+			onCreateDocumentAt: (position) => void this.createStandaloneDocument(position),
+			onCreateDocumentForTask: (node, position) => void this.createDocumentForTask(node, position),
+			onLinkDocument: (node, document) => void this.linkDocumentToTask(node, document),
+			onOpenDocument: (document) => void this.openDocument(document),
+			onEditDocument: (document) => this.selectDocument(document),
+			onRemoveDocument: (document) => void this.removeDocumentFromCanvas(document),
 		});
 
 		this.registerEvent(this.app.vault.on('modify', (file) => {
+			const isDocument = file instanceof TFile
+				&& this.activeMap.documents.some((document) => document.path === file.path);
+			if (
+				isDocument
+				&& file.path === this.editorDocumentPath
+				&& this.editorDirty
+				&& file.stat.mtime > this.editorLoadedMtime
+			) {
+				new Notice('内容文件已在外部修改；当前快速编辑内容尚未覆盖，请重新载入或打开完整笔记');
+				return;
+			}
+			if (isDocument && Date.now() < this.ignoreDocumentModifyUntil) return;
+			if (isDocument) {
+				this.scheduleReload();
+				return;
+			}
 			if (file instanceof TFile && file.extension === 'md' && mapContainsPath(this.activeMap, file.path)) {
 				this.scheduleReload();
 			}
@@ -152,7 +217,9 @@ export class TaskGraphView extends ItemView {
 		this.registerEvent(this.app.vault.on('delete', () => this.scheduleReload()));
 		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
 			this.handleRenamedPath(oldPath, file.path);
-			this.scheduleReload();
+			void this.syncRenamedDocumentReferences(oldPath, file.path).finally(() => {
+				this.scheduleReload();
+			});
 		}));
 		this.registerEvent(this.app.vault.on('create', (file) => {
 			if (file instanceof TFile && file.extension === 'md' && mapContainsPath(this.activeMap, file.path)) {
@@ -168,6 +235,9 @@ export class TaskGraphView extends ItemView {
 		if (this.saveTimer !== null) {
 			window.clearTimeout(this.saveTimer);
 			await this.plugin.persistData();
+		}
+		if (!await this.flushDocumentEditor()) {
+			await this.preserveUnsavedDocumentDraft();
 		}
 		this.graphCanvas?.destroy();
 	}
@@ -192,6 +262,7 @@ export class TaskGraphView extends ItemView {
 		const primaryActions = primary.createDiv('tgf-primary-actions');
 		this.createTextButton(primaryActions, 'folder-cog', '来源', () => void this.manageSources());
 		this.createTextButton(primaryActions, 'plus', '新建任务', () => void this.createTask());
+		this.createTextButton(primaryActions, 'file-plus-2', '新建内容', () => void this.createStandaloneDocument());
 		this.createTextButton(primaryActions, 'layout-dashboard', '规整', () => void this.organizeGraph());
 
 		const searchField = secondary.createDiv('tgf-search');
@@ -199,7 +270,7 @@ export class TaskGraphView extends ItemView {
 		setIcon(searchIcon, 'search');
 		this.searchInputEl = searchField.createEl('input', {
 			type: 'search',
-			placeholder: '搜索任务、标签或 ID',
+			placeholder: '搜索任务、内容、标签或 ID',
 		});
 		this.searchInputEl.addEventListener('input', () => {
 			this.searchQuery = this.searchInputEl.value.trim().toLocaleLowerCase();
@@ -207,11 +278,11 @@ export class TaskGraphView extends ItemView {
 		});
 
 		const statusGroup = secondary.createDiv('tgf-status-filter');
-		(['todo', 'in_progress', 'done'] as TaskStatus[]).forEach((status) => {
-			const button = statusGroup.createEl('button', {
-				cls: 'tgf-filter-chip is-active',
-				text: STATUS_LABELS[status],
-			});
+			(['todo', 'in_progress', 'done', 'canceled', 'custom'] as TaskStatus[]).forEach((status) => {
+				const button = statusGroup.createEl('button', {
+					cls: `tgf-filter-chip${this.enabledStatuses.has(status) ? ' is-active' : ''}`,
+					text: STATUS_LABELS[status],
+				});
 			button.addEventListener('click', () => {
 				if (this.enabledStatuses.has(status)) {
 					this.enabledStatuses.delete(status);
@@ -219,9 +290,13 @@ export class TaskGraphView extends ItemView {
 				} else {
 					this.enabledStatuses.add(status);
 					button.addClass('is-active');
-				}
-				this.renderGraph();
-			});
+					}
+					if (status === 'done') {
+						this.plugin.data.showCompleted = this.enabledStatuses.has('done');
+						this.queueSave();
+					}
+					this.renderGraph();
+				});
 		});
 
 		const actions = secondary.createDiv('tgf-toolbar-actions');
@@ -299,9 +374,33 @@ export class TaskGraphView extends ItemView {
 
 	private handleRenamedPath(oldPath: string, newPath: string): void {
 		this.currentFilePath = renamePathValue(this.currentFilePath, oldPath, newPath);
+		this.editorDocumentPath = renamePathValue(this.editorDocumentPath, oldPath, newPath);
 		this.expandedSourceFolders = new Set(Array.from(this.expandedSourceFolders, (path) => (
 			renamePathValue(path, oldPath, newPath)
 		)));
+	}
+
+	private async syncRenamedDocumentReferences(oldPath: string, newPath: string): Promise<void> {
+		for (const [documentPath, aliasesByTaskId] of this.documentLinkAliases) {
+			const nextPath = renamePathValue(documentPath, oldPath, newPath);
+			if (nextPath === documentPath) continue;
+			const tasks = Array.from(aliasesByTaskId.keys())
+				.map((taskId) => this.graphData.nodes.find((task) => task.id === taskId))
+				.filter((task): task is DerivedTaskNode => Boolean(task));
+			try {
+				await renameTaskDocumentLinks(
+					this.app,
+					tasks,
+					documentPath,
+					nextPath,
+					undefined,
+					aliasesByTaskId,
+				);
+			} catch {
+				// Obsidian may already have updated a non-ID task link. Reloading below
+				// will resolve the current source of truth without blocking the rename.
+			}
+		}
 	}
 
 	private populateMapOptions(): void {
@@ -314,6 +413,7 @@ export class TaskGraphView extends ItemView {
 	}
 
 	private async createMap(): Promise<void> {
+		if (!await this.flushDocumentEditor()) return;
 		const name = await requestMapName(this.app, '新建任务地图');
 		if (!name) return;
 		const map = createTaskMap(name);
@@ -333,6 +433,7 @@ export class TaskGraphView extends ItemView {
 	}
 
 	private async deleteMap(): Promise<void> {
+		if (!await this.flushDocumentEditor()) return;
 		if (this.plugin.data.maps.length === 1) {
 			new Notice('至少需要保留一张任务地图');
 			return;
@@ -353,6 +454,11 @@ export class TaskGraphView extends ItemView {
 
 	private async switchMap(mapId: string): Promise<void> {
 		if (!this.plugin.data.maps.some((map) => map.id === mapId)) return;
+		if (!await this.flushDocumentEditor()) {
+			this.mapSelectEl.value = this.plugin.data.activeMapId;
+			return;
+		}
+		this.resetDocumentEditorState();
 		this.plugin.data.activeMapId = mapId;
 		this.selectedId = null;
 		this.currentFilePath = '';
@@ -369,29 +475,63 @@ export class TaskGraphView extends ItemView {
 	}
 
 	private async reloadMap(): Promise<void> {
+		const generation = ++this.reloadGeneration;
 		this.populateMapOptions();
 		const map = this.activeMap;
+		const mapId = map.id;
 		const hadSavedPositions = Object.keys(map.nodePositions).length > 0;
 		const resolved = resolveMapSources(this.app, map);
 		const results = await Promise.all(resolved.files.map(async (file) => {
 			try {
 				const content = await this.app.vault.cachedRead(file);
-				return [file.path, parseTaskFile(file.path, content)] as const;
-			} catch {
-				return [file.path, [] as TaskNode[]] as const;
+				return { path: file.path, tasks: parseTaskFile(file.path, content), error: null };
+			} catch (error) {
+				return { path: file.path, tasks: [] as TaskNode[], error };
 			}
 		}));
+		if (generation !== this.reloadGeneration || this.activeMap.id !== mapId) return;
+		const failedPaths = results.filter((result) => result.error).map((result) => result.path);
+		if (failedPaths.length > 0) {
+			new Notice(
+				`读取 ${failedPaths.length} 个任务文件失败，已保留错误提示：${failedPaths.slice(0, 3).join('、')}`,
+			);
+		}
 
+		const preliminaryTasks = results.flatMap((result) => result.tasks);
+		const contentPaths = new Set(collectDocumentPaths(this.app, map, preliminaryTasks).keys());
 		this.taskCache.clear();
-		results.forEach(([path, tasks]) => this.taskCache.set(path, tasks));
-		if (!this.currentFilePath || !resolved.files.some((file) => file.path === this.currentFilePath)) {
+		results.forEach(({ path, tasks }) => {
+			if (!contentPaths.has(path)) this.taskCache.set(path, tasks);
+		});
+		const taskSourceFiles = resolved.files.filter((file) => !contentPaths.has(file.path));
+		if (!this.currentFilePath || !taskSourceFiles.some((file) => file.path === this.currentFilePath)) {
 			const preferred = this.plugin.pendingScopePath;
-			this.currentFilePath = resolved.files.some((file) => file.path === preferred)
+			this.currentFilePath = taskSourceFiles.some((file) => file.path === preferred)
 				? preferred
-				: resolved.files[0]?.path ?? '';
+				: taskSourceFiles[0]?.path ?? '';
 			this.plugin.pendingScopePath = '';
 		}
 		this.graphData = buildTaskGraph(Array.from(this.taskCache.values()).flat());
+		this.documentLinkAliases.clear();
+		this.graphData.nodes.forEach((task) => {
+			task.documentLinks.forEach((link) => {
+				const path = resolveDocumentPath(this.app, link, task.path);
+				const byTask = this.documentLinkAliases.get(path) ?? new Map<string, string[]>();
+				const aliases = byTask.get(task.id) ?? [];
+				if (!aliases.includes(link)) aliases.push(link);
+				byTask.set(task.id, aliases);
+				this.documentLinkAliases.set(path, byTask);
+			});
+		});
+		collectDocumentPaths(this.app, map, this.graphData.nodes).forEach((_, path) => {
+			if (!map.documents.some((document) => document.path === path)) {
+				map.documents.push({ path, expanded: false });
+			}
+		});
+		const documentNodes = await loadDocumentNodes(this.app, map, this.graphData.nodes);
+		if (generation !== this.reloadGeneration || this.activeMap.id !== mapId) return;
+		this.documentNodes = documentNodes;
+		this.documentEdges = buildDocumentEdges(this.documentNodes);
 		this.seedMissingPositions();
 		if (!hadSavedPositions && this.graphData.nodes.length > 0) this.shouldFitAfterRender = true;
 		this.graphCanvas?.setViewport(map.viewport);
@@ -406,9 +546,28 @@ export class TaskGraphView extends ItemView {
 	private seedMissingPositions(): void {
 		const map = this.activeMap;
 		const layout = layoutGraph(this.graphData.nodes, this.graphData.edges);
+		const expandedPaths = this.expandedDocumentPaths();
+		const hasTaskPositions = this.graphData.nodes.some((node) => Boolean(map.nodePositions[taskPositionKey(node)]));
+		const taskNodes = layout.nodes.map((node) => {
+			const saved = map.nodePositions[taskPositionKey(node)];
+			return saved ? { ...node, ...saved } : node;
+		});
+		const organized = layoutTaskDocuments(
+			{ ...layout, nodes: taskNodes },
+			this.documentNodes,
+			expandedPaths,
+			!hasTaskPositions,
+		);
 		let changed = false;
-		layout.nodes.forEach((node) => {
+		organized.tasks.forEach((node) => {
 			const key = taskPositionKey(node);
+			if (!map.nodePositions[key]) {
+				map.nodePositions[key] = { x: node.x, y: node.y };
+				changed = true;
+			}
+		});
+		organized.documents.forEach((node) => {
+			const key = documentPositionKey(node.path);
 			if (!map.nodePositions[key]) {
 				map.nodePositions[key] = { x: node.x, y: node.y };
 				changed = true;
@@ -434,6 +593,10 @@ export class TaskGraphView extends ItemView {
 			(file) => {
 				if (!mapContainsPath(map, file.path)) {
 					new Notice('请先勾选这个文件或它所在的文件夹');
+					return;
+				}
+				if (map.documents.some((document) => document.path === file.path)) {
+					new Notice('这个文件在当前地图中作为内容文件使用，不会作为任务来源');
 					return;
 				}
 				this.currentFilePath = file.path;
@@ -484,6 +647,30 @@ export class TaskGraphView extends ItemView {
 		if (this.activeMap.sources.length > 4) {
 			chips.createSpan({ cls: 'tgf-source-more', text: `+${this.activeMap.sources.length - 4}` });
 		}
+		if (this.activeMap.documents.length > 0) {
+			const documents = this.sourceSummaryEl.createDiv('tgf-source-documents');
+			documents.createDiv({
+				cls: 'tgf-section-title',
+				text: `内容文件 · ${this.activeMap.documents.length}`,
+			});
+			this.activeMap.documents.slice(0, 4).forEach((config) => {
+				const node = this.documentNodes.find((document) => document.path === config.path);
+				const button = documents.createEl('button', {
+					cls: 'tgf-source-document',
+					text: node?.title ?? config.path.split('/').pop() ?? config.path,
+					attr: { title: config.path },
+				});
+				button.addEventListener('click', () => {
+					if (node) this.expandAndSelectDocument(node);
+				});
+			});
+			if (this.activeMap.documents.length > 4) {
+				documents.createSpan({
+					cls: 'tgf-source-more',
+					text: `另有 ${this.activeMap.documents.length - 4} 个`,
+				});
+			}
+		}
 	}
 
 	private renderCurrentFile(): void {
@@ -524,18 +711,50 @@ export class TaskGraphView extends ItemView {
 		});
 	}
 
-	private createPositionedLayout(): LayoutResult {
+	private createPositionedLayout(): CanvasLayout {
 		const automatic = layoutGraph(this.graphData.nodes, this.graphData.edges);
 		let width = automatic.width;
 		let height = automatic.height;
-		const nodes = automatic.nodes.map((node) => {
+		const taskNodes = automatic.nodes.map((node) => {
 			const saved = this.activeMap.nodePositions[taskPositionKey(node)];
 			const positioned = saved ? { ...node, x: saved.x, y: saved.y } : node;
 			width = Math.max(width, positioned.x + positioned.width + 72);
 			height = Math.max(height, positioned.y + positioned.height + 72);
 			return positioned;
 		});
+		const documentNodes = this.positionDocumentNodes({ ...automatic, nodes: taskNodes }, true);
+		documentNodes.forEach((node) => {
+			width = Math.max(width, node.x + node.width + 72);
+			height = Math.max(height, node.y + node.height + 72);
+		});
+		const nodes: PositionedGraphNode[] = [...taskNodes, ...documentNodes];
 		return { nodes, width, height };
+	}
+
+	private positionDocumentNodes(
+		taskLayout: LayoutResult,
+		useSaved: boolean,
+	): PositionedDocumentNode[] {
+		const result = layoutTaskDocuments(
+			taskLayout,
+			this.documentNodes,
+			this.expandedDocumentPaths(),
+			false,
+		).documents;
+		return result.map((node) => {
+			const saved = useSaved
+				? this.activeMap.nodePositions[documentPositionKey(node.path)]
+				: null;
+			return saved ? { ...node, ...saved } : node;
+		});
+	}
+
+	private expandedDocumentPaths(): Set<string> {
+		return new Set(
+			this.activeMap.documents
+				.filter((document) => document.expanded)
+				.map((document) => document.path),
+		);
 	}
 
 	private renderGraph(): void {
@@ -548,7 +767,14 @@ export class TaskGraphView extends ItemView {
 			});
 		}
 		const relatedIds = this.searchQuery ? this.collectRelatedIds(queryMatches) : null;
-		const nodes = allLayout.nodes.filter((node) => {
+			const nodes = allLayout.nodes.filter((node) => {
+				if ('nodeType' in node) {
+					if (node.id === this.selectedId && this.editorDirty) return true;
+					if (!this.searchQuery) return true;
+				const haystack = `${node.title} ${node.excerpt} ${node.path}`.toLocaleLowerCase();
+				return haystack.includes(this.searchQuery)
+					|| node.linkedTaskIds.some((id) => relatedIds?.has(id));
+			}
 			if (!this.enabledStatuses.has(node.status)) return false;
 			return relatedIds ? relatedIds.has(node.id) : true;
 		});
@@ -556,13 +782,27 @@ export class TaskGraphView extends ItemView {
 		const edges = this.graphData.edges.filter((edge) => (
 			visibleIds.has(edge.sourceId) && visibleIds.has(edge.targetId)
 		));
+		const documentEdges = this.documentEdges.filter((edge) => (
+			visibleIds.has(edge.taskNodeId) && visibleIds.has(edge.documentNodeId)
+		));
 		if (this.selectedId && !visibleIds.has(this.selectedId)) this.selectedId = null;
-		this.graphCanvas?.render({ ...allLayout, nodes }, edges, this.selectedId);
-		const selected = this.selectedId
+		this.graphCanvas?.render({ ...allLayout, nodes }, edges, documentEdges, this.selectedId);
+		const selectedTask = this.selectedId
 			? this.graphData.nodes.find((node) => node.id === this.selectedId) ?? null
 			: null;
-		this.renderInspector(selected);
-		this.renderStatusBar(nodes);
+		const selectedDocument = this.selectedId
+			? this.documentNodes.find((node) => node.id === this.selectedId) ?? null
+			: null;
+			if (selectedDocument) {
+				if (this.inspectorEl.dataset.documentPath !== selectedDocument.path) {
+					this.renderDocumentInspector(selectedDocument);
+				}
+			} else {
+				this.renderInspector(selectedTask);
+			}
+		this.renderStatusBar(nodes.filter(
+			(node): node is PositionedTaskNode => !('nodeType' in node),
+		));
 	}
 
 	private collectRelatedIds(seedIds: Set<string>): Set<string> {
@@ -589,19 +829,31 @@ export class TaskGraphView extends ItemView {
 
 	private async organizeGraph(): Promise<void> {
 		const layout = layoutGraph(this.graphData.nodes, this.graphData.edges);
+		const organized = layoutTaskDocuments(
+			layout,
+			this.documentNodes,
+			this.expandedDocumentPaths(),
+			true,
+		);
 		const positions: Record<string, NodePosition> = {};
-		layout.nodes.forEach((node) => {
+		organized.tasks.forEach((node) => {
 			positions[taskPositionKey(node)] = { x: node.x, y: node.y };
+		});
+		organized.documents.forEach((node) => {
+			positions[documentPositionKey(node.path)] = { x: node.x, y: node.y };
 		});
 		this.activeMap.nodePositions = positions;
 		await this.plugin.persistData();
 		this.renderGraph();
 		window.setTimeout(() => this.graphCanvas?.fitView(), 0);
-		new Notice('已按依赖关系重新规整地图');
+		new Notice('已按任务关系和内容归属重新规整地图');
 	}
 
-	private saveNodePosition(node: PositionedTaskNode, position: NodePosition): void {
-		this.activeMap.nodePositions[taskPositionKey(node)] = position;
+	private saveNodePosition(node: PositionedGraphNode, position: NodePosition): void {
+		const key = 'nodeType' in node
+			? documentPositionKey(node.path)
+			: taskPositionKey(node);
+		this.activeMap.nodePositions[key] = position;
 		this.queueSave();
 	}
 
@@ -618,14 +870,34 @@ export class TaskGraphView extends ItemView {
 		}, 300);
 	}
 
-	private selectNode(node: PositionedTaskNode): void {
+	private async selectNode(node: PositionedTaskNode): Promise<void> {
+		if (!await this.flushDocumentEditor()) return;
+		this.resetDocumentEditorState();
 		this.selectedId = node.id;
 		this.graphCanvas?.setSelected(node.id);
 		this.renderInspector(node);
 	}
 
+	private async selectGraphNode(node: PositionedGraphNode): Promise<void> {
+		if ('nodeType' in node) await this.selectDocument(node);
+		else await this.selectNode(node);
+	}
+
+	private async selectDocument(node: DocumentNode): Promise<void> {
+		if (
+			this.editorDocumentPath !== node.path
+			&& !await this.flushDocumentEditor()
+		) return;
+		this.selectedId = node.id;
+		this.graphCanvas?.setSelected(node.id);
+		if (this.inspectorEl.dataset.documentPath !== node.path) {
+			this.renderDocumentInspector(node);
+		}
+	}
+
 	private renderInspector(node: DerivedTaskNode | null): void {
 		this.inspectorEl.empty();
+		delete this.inspectorEl.dataset.documentPath;
 		if (!node) {
 			this.inspectorEl.addClass('is-empty');
 			const icon = this.inspectorEl.createDiv('tgf-empty-icon');
@@ -672,6 +944,35 @@ export class TaskGraphView extends ItemView {
 				chip.addEventListener('click', () => void this.removeTag(node, tag));
 			});
 		}
+		const contentSection = this.inspectorEl.createDiv('tgf-inspector-section');
+		const contentHeader = contentSection.createDiv('tgf-section-heading');
+		contentHeader.createDiv({ cls: 'tgf-section-title', text: '任务内容' });
+		const contentActions = contentHeader.createDiv('tgf-section-actions');
+		contentActions.createEl('button', { text: '新建' })
+			.addEventListener('click', () => void this.createDocumentForTask(node));
+		contentActions.createEl('button', { text: '关联笔记' })
+			.addEventListener('click', () => void this.chooseDocumentForTask(node));
+		const linkedDocuments = this.documentNodes.filter((document) => (
+			document.linkedTaskIds.includes(node.id)
+		));
+		if (linkedDocuments.length === 0) {
+			contentSection.createDiv({ cls: 'tgf-muted', text: '还没有关联内容文件' });
+		} else {
+			const list = contentSection.createDiv('tgf-linked-document-list');
+			linkedDocuments.forEach((document) => {
+				const row = list.createDiv('tgf-linked-document');
+				const main = row.createEl('button', { cls: 'tgf-linked-document-main' });
+				setIcon(main.createSpan(), document.missing ? 'file-warning' : 'file-text');
+				main.createSpan({ text: document.title });
+				main.addEventListener('click', () => this.expandAndSelectDocument(document));
+				const unlink = row.createEl('button', {
+					cls: 'tgf-linked-document-unlink',
+					attr: { title: '解除内容关联', 'aria-label': `解除 ${document.title} 的关联` },
+				});
+				setIcon(unlink, 'unlink');
+				unlink.addEventListener('click', () => void this.unlinkDocumentFromTask(node, document));
+			});
+		}
 		const relationships = this.inspectorEl.createDiv('tgf-inspector-section');
 		relationships.createDiv({ cls: 'tgf-section-title', text: '任务关系' });
 		if (node.blockedByIds.length === 0 && node.dependentIds.length === 0) {
@@ -709,11 +1010,268 @@ export class TaskGraphView extends ItemView {
 				? '开始任务'
 				: node.status === 'in_progress'
 					? '标记完成'
-					: '恢复待办',
+					: node.status === 'custom'
+						? '切换完成状态'
+						: '恢复待办',
 		});
 		toggle.addEventListener('click', () => void this.toggleTask(node));
 		const remove = actions.createEl('button', { cls: 'mod-warning', text: '删除任务' });
 		remove.addEventListener('click', () => void this.deleteTask(node));
+	}
+
+	private renderDocumentInspector(document: DocumentNode): void {
+		this.inspectorEl.empty();
+		this.inspectorEl.dataset.documentPath = document.path;
+		this.inspectorEl.removeClass('is-empty');
+		const header = this.inspectorEl.createDiv('tgf-inspector-header');
+		header.createDiv({
+			cls: `tgf-inspector-kicker${document.missing ? ' is-blocked' : ' is-ready'}`,
+			text: document.missing ? '内容文件缺失' : '任务内容',
+		});
+		const close = this.createIconButton(header, 'x', '关闭详情', () => {
+			void this.closeDocumentInspector();
+		});
+		close.addClass('tgf-inspector-close');
+		this.inspectorEl.createEl('h2', {
+			cls: 'tgf-inspector-title',
+			text: document.title,
+			attr: { 'aria-label': document.title },
+		});
+		const source = this.inspectorEl.createDiv('tgf-inspector-source');
+		setIcon(source.createSpan(), document.missing ? 'file-warning' : 'file-text');
+		source.createSpan({ text: document.path });
+		const facts = this.inspectorEl.createDiv('tgf-facts');
+		this.addFact(facts, '字数', String(document.wordCount));
+		this.addFact(
+			facts,
+			'清单进度',
+			document.checklistTotal > 0
+				? `${document.checklistDone} / ${document.checklistTotal}（${Math.round(document.checklistDone / document.checklistTotal * 100)}%）`
+				: '暂无清单',
+		);
+		this.addFact(facts, '关联任务', String(document.linkedTaskIds.length));
+		this.addFact(
+			facts,
+			'最后修改',
+			document.mtime ? new Date(document.mtime).toLocaleString('zh-CN') : '未知',
+		);
+
+		if (document.missing) {
+			const warning = this.inspectorEl.createDiv('tgf-inspector-warning');
+			setIcon(warning.createSpan(), 'triangle-alert');
+			warning.createSpan({ text: '原路径仍被保留，可以重新绑定到 Vault 中的其他 Markdown 文件。' });
+			const rebind = this.inspectorEl.createEl('button', { cls: 'mod-cta', text: '重新绑定文件' });
+			rebind.addEventListener('click', () => void this.rebindMissingDocument(document));
+		} else {
+			this.renderDocumentEditor(document);
+		}
+
+		this.renderDocumentTaskLinks(document);
+		const actions = this.inspectorEl.createDiv('tgf-inspector-actions');
+		if (!document.missing) {
+			actions.createEl('button', { cls: 'mod-cta', text: '打开完整笔记' })
+				.addEventListener('click', () => void this.openDocument(document));
+			actions.createEl('button', { text: '重命名文件' })
+				.addEventListener('click', () => void this.renameDocument(document));
+		}
+		actions.createEl('button', { text: '从画布移除' })
+			.addEventListener('click', () => void this.removeDocumentFromCanvas(document));
+		if (!document.missing) {
+			actions.createEl('button', { cls: 'mod-warning', text: '删除内容文件' })
+				.addEventListener('click', () => void this.deleteDocumentFile(document));
+		}
+	}
+
+	private renderDocumentEditor(document: DocumentNode): void {
+		const section = this.inspectorEl.createDiv('tgf-inspector-section tgf-document-editor-section');
+		const header = section.createDiv('tgf-section-heading');
+		header.createDiv({ cls: 'tgf-section-title', text: '快速编辑' });
+		const tabs = header.createDiv('tgf-section-actions');
+		const editButton = tabs.createEl('button', { cls: 'is-active', text: '编辑' });
+		const previewButton = tabs.createEl('button', { text: '预览' });
+		const status = section.createDiv({ cls: 'tgf-editor-status', text: '正在读取…' });
+		const textarea = section.createEl('textarea', {
+			cls: 'tgf-document-editor',
+			attr: { placeholder: '在这里快速编辑 Markdown 内容…' },
+		});
+		const preview = section.createDiv('tgf-document-preview');
+		preview.hide();
+		const file = this.app.vault.getAbstractFileByPath(document.path);
+		if (!(file instanceof TFile)) return;
+		const loadGeneration = ++this.editorLoadGeneration;
+		this.editorDocumentPath = document.path;
+		this.editorLoadedMtime = file.stat.mtime;
+		this.editorDirty = false;
+		textarea.disabled = true;
+		void this.app.vault.read(file).then((content) => {
+			if (
+				loadGeneration !== this.editorLoadGeneration
+				|| this.selectedId !== document.id
+				|| this.editorDocumentPath !== document.path
+				|| this.editorDirty
+			) return;
+			this.editorValue = content;
+			textarea.value = content;
+			textarea.disabled = false;
+			status.setText('已保存');
+		}).catch((error) => {
+			if (loadGeneration !== this.editorLoadGeneration) return;
+			textarea.disabled = true;
+			status.setText('读取失败');
+			this.showError(error, '读取内容失败');
+		});
+		textarea.addEventListener('input', () => {
+			this.editorValue = textarea.value;
+			this.editorDirty = true;
+			status.setText('未保存');
+			if (this.documentSaveTimer !== null) window.clearTimeout(this.documentSaveTimer);
+			this.documentSaveTimer = window.setTimeout(() => {
+				this.documentSaveTimer = null;
+				void this.saveDocumentEditor(status);
+			}, 600);
+		});
+		textarea.addEventListener('keydown', (event) => {
+			if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 's') {
+				event.preventDefault();
+				void this.saveDocumentEditor(status);
+			}
+		});
+		editButton.addEventListener('click', () => {
+			editButton.addClass('is-active');
+			previewButton.removeClass('is-active');
+			preview.hide();
+			textarea.show();
+			textarea.focus();
+		});
+		previewButton.addEventListener('click', () => {
+			editButton.removeClass('is-active');
+			previewButton.addClass('is-active');
+			textarea.hide();
+			preview.show();
+			preview.empty();
+			void MarkdownRenderer.render(this.app, textarea.value, preview, document.path, this);
+		});
+	}
+
+	private renderDocumentTaskLinks(document: DocumentNode): void {
+		const section = this.inspectorEl.createDiv('tgf-inspector-section');
+		section.createDiv({ cls: 'tgf-section-title', text: '关联任务' });
+		const search = section.createEl('input', {
+			type: 'search',
+			cls: 'tgf-document-task-search',
+			placeholder: '搜索并勾选任务',
+		});
+		const list = section.createDiv('tgf-document-task-list');
+		const draw = () => {
+			list.empty();
+			const query = search.value.trim().toLocaleLowerCase();
+			this.graphData.nodes
+				.filter((task) => !query || `${task.text} ${task.path}`.toLocaleLowerCase().includes(query))
+				.forEach((task) => {
+					const row = list.createEl('label', { cls: 'tgf-document-task-row' });
+					const checkbox = row.createEl('input', { type: 'checkbox' });
+					checkbox.checked = document.linkedTaskIds.includes(task.id);
+					row.createSpan({ text: task.text, attr: { title: task.path } });
+					checkbox.addEventListener('change', () => {
+						if (checkbox.checked) void this.linkDocumentToTask(task, document);
+						else void this.unlinkDocumentFromTask(task, document);
+					});
+				});
+		};
+		search.addEventListener('input', draw);
+		draw();
+	}
+
+	private async saveDocumentEditor(status?: HTMLElement): Promise<void> {
+		if (this.documentSavePromise) await this.documentSavePromise;
+		if (!this.editorDirty || !this.editorDocumentPath) return;
+		const path = this.editorDocumentPath;
+		const loadedMtime = this.editorLoadedMtime;
+		const value = this.editorValue;
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) {
+			status?.setText('文件不存在');
+			return;
+		}
+		if (file.stat.mtime > loadedMtime) {
+			status?.setText('检测到外部修改，未覆盖');
+			new Notice('内容文件已被外部修改，请重新载入或打开完整笔记处理冲突');
+			return;
+		}
+		this.editorDirty = false;
+		status?.setText('正在保存…');
+		const savePromise = (async () => {
+			try {
+				this.ignoreDocumentModifyUntil = Date.now() + 1200;
+				await this.app.vault.modify(file, value);
+				const stats = calculateDocumentStats(value);
+				const node = this.documentNodes.find((item) => item.path === file.path);
+				if (node) Object.assign(node, stats, { mtime: file.stat.mtime });
+				if (this.editorDocumentPath === path) {
+					this.editorLoadedMtime = file.stat.mtime;
+					status?.setText(this.editorDirty ? '未保存' : '已保存');
+				}
+			} catch (error) {
+				if (this.editorDocumentPath === path) this.editorDirty = true;
+				status?.setText('保存失败');
+				this.showError(error, '保存内容失败');
+			}
+		})();
+		this.documentSavePromise = savePromise;
+		try {
+			await savePromise;
+		} finally {
+			if (this.documentSavePromise === savePromise) this.documentSavePromise = null;
+		}
+	}
+
+	private async flushDocumentEditor(): Promise<boolean> {
+		if (this.documentSaveTimer !== null) {
+			window.clearTimeout(this.documentSaveTimer);
+			this.documentSaveTimer = null;
+		}
+		await this.saveDocumentEditor();
+		if (this.documentSavePromise) await this.documentSavePromise;
+		if (this.editorDirty) await this.saveDocumentEditor();
+		return !this.editorDirty;
+	}
+
+	private resetDocumentEditorState(): void {
+		this.editorLoadGeneration += 1;
+		this.editorDocumentPath = '';
+		this.editorLoadedMtime = 0;
+		this.editorDirty = false;
+		this.editorValue = '';
+	}
+
+	private async closeDocumentInspector(): Promise<void> {
+		if (!await this.flushDocumentEditor()) return;
+		this.resetDocumentEditorState();
+		this.selectedId = null;
+		this.graphCanvas?.setSelected(null);
+		this.renderInspector(null);
+	}
+
+	private async preserveUnsavedDocumentDraft(): Promise<void> {
+		if (!this.editorDocumentPath || !this.editorDirty) return;
+		const slash = this.editorDocumentPath.lastIndexOf('/');
+		const folder = slash >= 0 ? this.editorDocumentPath.slice(0, slash) : '';
+		const baseName = (slash >= 0
+			? this.editorDocumentPath.slice(slash + 1)
+			: this.editorDocumentPath
+		).replace(/\.md$/i, '');
+		const recoveryPath = uniqueDocumentPath(
+			this.app,
+			folder,
+			sanitizeDocumentTitle(`${baseName}-TaskGraph-恢复`),
+		);
+		try {
+			await this.app.vault.create(recoveryPath, this.editorValue);
+			new Notice(`快速编辑内容未能安全覆盖，已保存恢复副本：${recoveryPath}`);
+			this.editorDirty = false;
+		} catch (error) {
+			this.showError(error, '保存快速编辑恢复副本失败');
+		}
 	}
 
 	private addFact(parent: HTMLElement, label: string, value: string): void {
@@ -758,6 +1316,9 @@ export class TaskGraphView extends ItemView {
 		const warnings = this.graphData.nodes.filter((node) => node.warnings.length > 0).length;
 		const missing = resolveMapSources(this.app, this.activeMap).missing.length;
 		this.statusBarEl.createSpan({ cls: 'tgf-status-primary', text: `${visibleNodes.length} / ${total} 个任务` });
+		this.statusBarEl.createSpan({
+			text: `${this.activeMap.documents.filter((document) => document.expanded).length} 个内容节点`,
+		});
 		this.statusBarEl.createSpan({ text: `${done} 已完成` });
 		this.statusBarEl.createSpan({ text: `${active} 进行中` });
 		this.statusBarEl.createSpan({ cls: 'is-ready', text: `${ready} 可开始` });
@@ -805,6 +1366,412 @@ export class TaskGraphView extends ItemView {
 			new Notice('任务已添加到地图');
 		} catch (error) {
 			this.showError(error, '创建任务失败');
+		}
+	}
+
+	private async createStandaloneDocument(position?: NodePosition): Promise<void> {
+		if (!this.currentFilePath) {
+			new Notice('请先在来源面板中选择一个当前文件，作为内容文件的默认目录');
+			return;
+		}
+		const title = await requestTextValue(this.app, '新建内容文件', '文件标题', '例如：第二步方案');
+		if (!title) return;
+		let createdFile: TFile | null = null;
+		try {
+			const file = await createContentDocument(this.app, this.currentFilePath, title);
+			createdFile = file;
+			registerDocument(this.activeMap, file.path, true);
+			this.activeMap.nodePositions[documentPositionKey(file.path)] = position
+				?? this.graphCanvas?.getViewportCenter()
+				?? { x: 72, y: 72 };
+			await this.plugin.persistData();
+			await this.reloadMap();
+			const document = this.documentNodes.find((item) => item.path === file.path);
+			if (document) this.selectDocument(document);
+			new Notice('内容文件已创建');
+		} catch (error) {
+			if (createdFile) {
+				removeRegisteredDocument(this.activeMap, createdFile.path);
+				try {
+					await this.app.vault.delete(createdFile);
+				} catch {
+					// Keep the original operation error.
+				}
+			}
+			this.showError(error, '创建内容文件失败');
+		}
+	}
+
+	private async createDocumentForTask(
+		task: TaskNode,
+		position?: NodePosition,
+	): Promise<void> {
+		let createdFile: TFile | null = null;
+		let linkedTask: TaskNode | null = null;
+		try {
+			let currentTask = task;
+			if (!currentTask.taskId) {
+				const candidate = this.nextTaskId();
+				const oldKey = taskPositionKey(currentTask);
+				const oldPosition = this.activeMap.nodePositions[oldKey];
+				await assignTaskId(this.app, currentTask, candidate);
+				if (oldPosition) {
+					delete this.activeMap.nodePositions[oldKey];
+					this.activeMap.nodePositions[`id:${candidate}`] = oldPosition;
+				}
+				await this.reloadMap();
+				currentTask = this.graphData.nodes.find((node) => node.taskId === candidate) ?? currentTask;
+			}
+			const file = await createContentDocument(
+				this.app,
+				currentTask.path,
+				currentTask.text,
+				currentTask.taskId,
+			);
+			createdFile = file;
+			registerDocument(this.activeMap, file.path, true);
+			await changeTaskDocumentLink(this.app, currentTask, file.path, true);
+			linkedTask = currentTask;
+			const taskLayout = this.createPositionedLayout().nodes.find((node) => node.id === currentTask.id);
+			const suggested = position ?? (
+				taskLayout && !('nodeType' in taskLayout)
+					? { x: taskLayout.x, y: taskLayout.y + taskLayout.height + 92 }
+					: this.graphCanvas?.getViewportCenter() ?? { x: 72, y: 72 }
+			);
+			this.activeMap.nodePositions[documentPositionKey(file.path)] = this.findFreePosition(suggested);
+			await this.plugin.persistData();
+			await this.reloadMap();
+			const document = this.documentNodes.find((item) => item.path === file.path);
+			if (document) this.selectDocument(document);
+			new Notice('任务内容已创建并关联');
+		} catch (error) {
+			if (linkedTask && createdFile) {
+				try {
+					await changeTaskDocumentLink(this.app, linkedTask, createdFile.path, false);
+				} catch {
+					// Keep the original operation error; the remaining link is still visible in Markdown.
+				}
+			}
+			if (createdFile) {
+				removeRegisteredDocument(this.activeMap, createdFile.path);
+				try {
+					await this.app.vault.delete(createdFile);
+				} catch {
+					// Keep the original operation error.
+				}
+			}
+			this.showError(error, '创建任务内容失败');
+		}
+	}
+
+	private async chooseDocumentForTask(task: TaskNode): Promise<void> {
+		const excluded = new Set(this.taskCache.keys());
+		const file = await chooseMarkdownFile(this.app, '关联已有内容文件', excluded);
+		if (!file) return;
+		const existing = this.documentNodes.find((document) => document.path === file.path) ?? {
+			id: `doc:${file.path}`,
+			nodeType: 'document' as const,
+			path: file.path,
+			title: file.basename,
+			excerpt: '',
+			wordCount: 0,
+			checklistDone: 0,
+			checklistTotal: 0,
+			mtime: file.stat.mtime,
+			linkedTaskIds: [],
+			missing: false,
+		};
+		await this.linkDocumentToTask(task, existing);
+	}
+
+	private async linkDocumentToTask(task: TaskNode, document: DocumentNode): Promise<void> {
+		if (document.linkedTaskIds.includes(task.id)) {
+			new Notice('这个内容文件已经关联该任务');
+			return;
+		}
+		let path = document.path;
+		const oldTaskKey = taskPositionKey(task);
+		const oldTaskPosition = this.activeMap.nodePositions[oldTaskKey];
+		let oldPath = path;
+		let moved = false;
+		let linkWritten = false;
+		const mapSnapshots = this.plugin.data.maps.map((map) => ({
+			map,
+			documents: map.documents.map((item) => ({ ...item })),
+			nodePositions: { ...map.nodePositions },
+		}));
+		try {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) throw new Error(`找不到内容文件：${path}`);
+			if (document.linkedTaskIds.length === 0) {
+				const targetFolder = contentFolderForFile(task.path);
+				const currentFolder = file.parent?.path ?? '';
+				if (currentFolder !== targetFolder) {
+					const shouldMove = await confirmAction(
+						this.app,
+						'移动内容文件？',
+						`这是该内容首次关联任务。是否移动到“${targetFolder}”目录？选择取消将保留原位置并继续关联。`,
+						'移动并关联',
+						false,
+					);
+					if (shouldMove) {
+						oldPath = path;
+						path = await moveContentDocumentBesideTask(this.app, file, task.path);
+						moved = true;
+						this.plugin.data.maps.forEach((map) => {
+							replaceRegisteredDocumentPath(map, oldPath, path);
+						});
+					}
+				}
+			}
+			registerDocument(this.activeMap, path, true);
+			await changeTaskDocumentLink(this.app, task, path, true);
+			linkWritten = true;
+			if (!this.activeMap.nodePositions[documentPositionKey(path)]) {
+				const taskNode = this.createPositionedLayout().nodes.find((node) => node.id === task.id);
+				const position = taskNode && !('nodeType' in taskNode)
+					? { x: taskNode.x, y: taskNode.y + taskNode.height + 92 }
+					: this.graphCanvas?.getViewportCenter() ?? { x: 72, y: 72 };
+				this.activeMap.nodePositions[documentPositionKey(path)] = this.findFreePosition(position);
+			}
+			await this.plugin.persistData();
+			await this.reloadMap();
+			await this.restoreTaskPosition(task, oldTaskKey, oldTaskPosition);
+			const updated = this.documentNodes.find((item) => item.path === path);
+			if (updated) this.selectDocument(updated);
+			new Notice('内容关联已建立');
+		} catch (error) {
+			if (linkWritten) {
+				try {
+					await changeTaskDocumentLink(this.app, task, path, false);
+				} catch {
+					// Preserve the original failure.
+				}
+			}
+			if (moved) {
+				const movedFile = this.app.vault.getAbstractFileByPath(path);
+				if (movedFile instanceof TFile) {
+					try {
+						await this.app.fileManager.renameFile(movedFile, oldPath);
+					} catch {
+						// Preserve the original failure.
+					}
+				}
+			}
+			mapSnapshots.forEach(({ map, documents, nodePositions }) => {
+				map.documents = documents;
+				map.nodePositions = nodePositions;
+			});
+			try {
+				await this.plugin.persistData();
+			} catch {
+				// Preserve the original failure.
+			}
+			this.showError(error, '建立内容关联失败');
+		}
+	}
+
+	private async unlinkDocumentFromTask(task: TaskNode, document: DocumentNode): Promise<void> {
+		const oldKey = taskPositionKey(task);
+		const oldPosition = this.activeMap.nodePositions[oldKey];
+		try {
+			await changeTaskDocumentLink(this.app, task, document.path, false);
+			await this.reloadMap();
+			await this.restoreTaskPosition(task, oldKey, oldPosition);
+			const updated = this.documentNodes.find((item) => item.path === document.path);
+			if (updated) this.selectDocument(updated);
+			new Notice('内容关联已解除，文件仍然保留');
+		} catch (error) {
+			this.showError(error, '解除内容关联失败');
+		}
+	}
+
+	private expandAndSelectDocument(document: DocumentNode): void {
+		registerDocument(this.activeMap, document.path, true);
+		this.queueSave();
+		this.renderGraph();
+		const updated = this.documentNodes.find((item) => item.path === document.path);
+		if (updated) this.selectDocument(updated);
+	}
+
+	private async removeDocumentFromCanvas(document: DocumentNode): Promise<void> {
+		if (!await this.flushDocumentEditor()) return;
+		const config = this.activeMap.documents.find((item) => item.path === document.path);
+		if (config) config.expanded = false;
+		delete this.activeMap.nodePositions[documentPositionKey(document.path)];
+		this.selectedId = null;
+		this.resetDocumentEditorState();
+		await this.plugin.persistData();
+		this.renderGraph();
+		new Notice('内容卡已从画布收起，文件和任务关联均未删除');
+	}
+
+	private async openDocument(document: DocumentNode): Promise<void> {
+		if (!await this.flushDocumentEditor()) return;
+		const file = this.app.vault.getAbstractFileByPath(document.path);
+		if (!(file instanceof TFile)) {
+			new Notice(`找不到内容文件：${document.path}`);
+			return;
+		}
+		await this.app.workspace.getLeaf('tab').openFile(file);
+	}
+
+	private async renameDocument(document: DocumentNode): Promise<void> {
+		const title = await requestTextValue(
+			this.app,
+			'重命名内容文件',
+			'新文件名',
+			document.title,
+		);
+		if (!title) return;
+		const file = this.app.vault.getAbstractFileByPath(document.path);
+		if (!(file instanceof TFile)) return;
+		const folder = file.parent?.path ?? '';
+		const safeTitle = sanitizeDocumentTitle(title);
+		if (safeTitle === file.basename) return;
+		const target = uniqueDocumentPath(this.app, folder, safeTitle);
+		const mapSnapshots = this.plugin.data.maps.map((map) => ({
+			map,
+			documents: map.documents.map((item) => ({ ...item })),
+			nodePositions: { ...map.nodePositions },
+		}));
+		try {
+			if (!await this.flushDocumentEditor()) return;
+			const linkedTasks = document.linkedTaskIds
+				.map((taskId) => this.graphData.nodes.find((node) => node.id === taskId))
+				.filter((task): task is DerivedTaskNode => Boolean(task));
+			await renameTaskDocumentLinks(
+				this.app,
+				linkedTasks,
+				document.path,
+				target,
+				async () => {
+					await this.app.fileManager.renameFile(file, target);
+					this.plugin.data.maps.forEach((map) => {
+						replaceRegisteredDocumentPath(map, document.path, target);
+					});
+					await this.plugin.persistData();
+				},
+			);
+			await this.reloadMap();
+			const updated = this.documentNodes.find((item) => item.path === target);
+			if (updated) this.selectDocument(updated);
+		} catch (error) {
+			const renamedFile = this.app.vault.getAbstractFileByPath(target);
+			if (
+				renamedFile instanceof TFile
+				&& !this.app.vault.getAbstractFileByPath(document.path)
+			) {
+				try {
+					await this.app.fileManager.renameFile(renamedFile, document.path);
+				} catch {
+					// Keep the original failure.
+				}
+			}
+			mapSnapshots.forEach(({ map, documents, nodePositions }) => {
+				map.documents = documents;
+				map.nodePositions = nodePositions;
+			});
+			try {
+				await this.plugin.persistData();
+			} catch {
+				// Keep the original failure.
+			}
+			this.showError(error, '重命名内容文件失败');
+		}
+	}
+
+	private async deleteDocumentFile(document: DocumentNode): Promise<void> {
+		const confirmed = await confirmAction(
+			this.app,
+			'删除内容文件？',
+			`将删除“${document.title}”并从 ${document.linkedTaskIds.length} 个任务中清理关联。此操作不可在 Task Graph 中撤销。`,
+			'删除文件',
+			true,
+		);
+		if (!confirmed) return;
+		const file = this.app.vault.getAbstractFileByPath(document.path);
+		if (!(file instanceof TFile)) return;
+		const mapSnapshots = this.plugin.data.maps.map((map) => ({
+			map,
+			documents: map.documents.map((item) => ({ ...item })),
+			nodePositions: { ...map.nodePositions },
+		}));
+		try {
+			if (!await this.flushDocumentEditor()) return;
+			const changes = document.linkedTaskIds
+				.map((taskId) => this.graphData.nodes.find((node) => node.id === taskId))
+				.filter((task): task is DerivedTaskNode => Boolean(task))
+				.map((task) => ({ task, path: document.path, add: false }));
+			await changeTaskDocumentLinks(
+				this.app,
+				changes,
+				async () => {
+					this.plugin.data.maps.forEach((map) => removeRegisteredDocument(map, document.path));
+					await this.plugin.persistData();
+					await this.app.fileManager.trashFile(file);
+				},
+			);
+			this.selectedId = null;
+			this.resetDocumentEditorState();
+			await this.reloadMap();
+			new Notice('内容文件已删除');
+		} catch (error) {
+			mapSnapshots.forEach(({ map, documents, nodePositions }) => {
+				map.documents = documents;
+				map.nodePositions = nodePositions;
+			});
+			try {
+				await this.plugin.persistData();
+			} catch {
+				// Keep the original failure.
+			}
+			this.showError(error, '删除内容文件失败');
+		}
+	}
+
+	private async rebindMissingDocument(document: DocumentNode): Promise<void> {
+		const file = await chooseMarkdownFile(
+			this.app,
+			'重新绑定内容文件',
+			new Set(this.taskCache.keys()),
+		);
+		if (!file) return;
+		const mapSnapshots = this.plugin.data.maps.map((map) => ({
+			map,
+			documents: map.documents.map((item) => ({ ...item })),
+			nodePositions: { ...map.nodePositions },
+		}));
+		try {
+			const linkedTasks = document.linkedTaskIds
+				.map((taskId) => this.graphData.nodes.find((node) => node.id === taskId))
+				.filter((task): task is DerivedTaskNode => Boolean(task));
+			await renameTaskDocumentLinks(
+				this.app,
+				linkedTasks,
+				document.path,
+				file.path,
+				async () => {
+					this.plugin.data.maps.forEach((map) => {
+						replaceRegisteredDocumentPath(map, document.path, file.path);
+					});
+					await this.plugin.persistData();
+				},
+			);
+			await this.reloadMap();
+			const updated = this.documentNodes.find((item) => item.path === file.path);
+			if (updated) this.selectDocument(updated);
+		} catch (error) {
+			mapSnapshots.forEach(({ map, documents, nodePositions }) => {
+				map.documents = documents;
+				map.nodePositions = nodePositions;
+			});
+			try {
+				await this.plugin.persistData();
+			} catch {
+				// Keep the original failure.
+			}
+			this.showError(error, '重新绑定内容文件失败');
 		}
 	}
 
@@ -1059,7 +2026,9 @@ export class TaskGraphView extends ItemView {
 		preferred?: NodePosition,
 	): NodePosition {
 		const layout = this.createPositionedLayout();
-		const anchor = layout.nodes.find((node) => node.taskId === anchorTaskId);
+		const anchor = layout.nodes.find((node) => (
+			!('nodeType' in node) && node.taskId === anchorTaskId
+		)) as PositionedTaskNode | undefined;
 		const siblingIds = new Set(
 			this.graphData.edges
 				.filter((edge) => {
@@ -1070,7 +2039,9 @@ export class TaskGraphView extends ItemView {
 				})
 				.map((edge) => direction === 'successor' ? edge.targetId : edge.sourceId),
 		);
-		const siblings = layout.nodes.filter((node) => siblingIds.has(node.id));
+		const siblings = layout.nodes.filter((node): node is PositionedTaskNode => (
+			!('nodeType' in node) && siblingIds.has(node.id)
+		));
 		const defaultX = direction === 'successor'
 			? (anchor?.x ?? 72) + 328
 			: Math.max(24, (anchor?.x ?? 400) - 328);
@@ -1198,9 +2169,12 @@ export class TaskGraphView extends ItemView {
 	}
 
 	private async toggleStar(task: TaskNode): Promise<void> {
+		const oldKey = taskPositionKey(task);
+		const oldPosition = this.activeMap.nodePositions[oldKey];
 		try {
 			await setTaskStar(this.app, task, !task.starred);
 			await this.reloadMap();
+			await this.restoreTaskPosition(task, oldKey, oldPosition);
 		} catch (error) {
 			this.showError(error, '更新星标失败');
 		}
@@ -1209,18 +2183,24 @@ export class TaskGraphView extends ItemView {
 	private async addTag(task: TaskNode): Promise<void> {
 		const tag = await requestTextValue(this.app, '添加任务标签', '标签', '例如：设计');
 		if (!tag) return;
+		const oldKey = taskPositionKey(task);
+		const oldPosition = this.activeMap.nodePositions[oldKey];
 		try {
 			await changeTaskTag(this.app, task, tag, true);
 			await this.reloadMap();
+			await this.restoreTaskPosition(task, oldKey, oldPosition);
 		} catch (error) {
 			this.showError(error, '添加标签失败');
 		}
 	}
 
 	private async removeTag(task: TaskNode, tag: string): Promise<void> {
+		const oldKey = taskPositionKey(task);
+		const oldPosition = this.activeMap.nodePositions[oldKey];
 		try {
 			await changeTaskTag(this.app, task, tag, false);
 			await this.reloadMap();
+			await this.restoreTaskPosition(task, oldKey, oldPosition);
 		} catch (error) {
 			this.showError(error, '移除标签失败');
 		}
@@ -1274,6 +2254,8 @@ export class TaskGraphView extends ItemView {
 			new Notice('需要安装并启用 Tasks 插件后才能更新任务状态');
 			return;
 		}
+		const oldKey = taskPositionKey(task);
+		const oldPosition = this.activeMap.nodePositions[oldKey];
 		try {
 			if (task.status === 'todo') {
 				await markTaskInProgress(this.app, task);
@@ -1295,9 +2277,30 @@ export class TaskGraphView extends ItemView {
 				}
 			}
 			await this.reloadMap();
+			await this.restoreTaskPosition(task, oldKey, oldPosition);
 		} catch (error) {
 			this.showError(error, '任务更新失败');
 		}
+	}
+
+	private async restoreTaskPosition(
+		previousTask: TaskNode,
+		oldKey: string,
+		position?: NodePosition,
+	): Promise<void> {
+		if (!position) return;
+		const updated = previousTask.taskId
+			? this.graphData.nodes.find((node) => node.taskId === previousTask.taskId)
+			: this.graphData.nodes.find((node) => (
+				node.path === previousTask.path && node.line === previousTask.line
+			));
+		if (!updated) return;
+		const newKey = taskPositionKey(updated);
+		if (newKey === oldKey) return;
+		delete this.activeMap.nodePositions[oldKey];
+		this.activeMap.nodePositions[newKey] = position;
+		await this.plugin.persistData();
+		this.renderGraph();
 	}
 
 	private showError(error: unknown, fallback: string): void {

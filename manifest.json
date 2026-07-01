@@ -1,7 +1,7 @@
 {
 	"id": "task-graph",
 	"name": "Task Graph",
-	"version": "0.3.3",
+	"version": "0.4.0",
 	"minAppVersion": "1.4.0",
 	"description": "将 Obsidian Tasks 组织为可编辑的项目依赖图，直观看清阻塞与下一步行动。",
 	"author": "Aaron",

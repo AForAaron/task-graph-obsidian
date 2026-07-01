@@ -1,13 +1,17 @@
-import { App, TFile } from 'obsidian';
+import { App, normalizePath, TFile } from 'obsidian';
 import { TaskNode } from '../model/TaskGraphModel';
 import {
 	addDependency,
+	addDocumentLink,
 	addTaskTag,
 	ensureSuccessorTaskMetadata,
 	ensureTaskId,
 	removeDependency,
+	removeDocumentLink,
 	removeTaskTag,
 	replaceTaskId,
+	replaceDocumentLink,
+	replaceTaskLineText,
 	setTaskStarred,
 } from './TaskLineMetadata';
 import { createTaskId } from './TaskId';
@@ -37,7 +41,7 @@ export function findTaskLine(lines: string[], task: TaskNode): number {
 
 export function normalizeTaskLine(line: string): string {
 	const trimmed = line.trim();
-	if (/^(?:[-*+]|\d+\.)\s+\[[ xX/\-]\]\s+/.test(trimmed)) return trimmed;
+	if (/^(?:[-*+]|\d+\.)\s+\[[^\]\r\n]\]\s+/.test(trimmed)) return trimmed;
 	return `- [ ] ${trimmed}`;
 }
 
@@ -78,8 +82,7 @@ export async function replaceTaskLine(
 ): Promise<void> {
 	const location = await readTaskLocation(app, task);
 	const original = location.lines[location.lineIndex];
-	const prefix = original.match(/^(\s*(?:>\s*)*)/)?.[1] ?? '';
-	location.lines[location.lineIndex] = `${prefix}${normalizeTaskLine(replacement)}`;
+	location.lines[location.lineIndex] = replaceTaskLineText(original, replacement);
 	await app.vault.modify(location.file, location.lines.join('\n'));
 }
 
@@ -88,6 +91,7 @@ type ContentMutation = (content: string) => string;
 async function applyFileMutations(
 	app: App,
 	mutations: Map<TFile, ContentMutation[]>,
+	afterWrite?: () => Promise<void>,
 ): Promise<void> {
 	const originals = new Map<TFile, string>();
 	const updated = new Map<TFile, string>();
@@ -102,9 +106,22 @@ async function applyFileMutations(
 			await app.vault.modify(file, content);
 			written.push(file);
 		}
+		if (afterWrite) await afterWrite();
 	} catch (error) {
+		let rollbackError: unknown = null;
 		for (const file of written.reverse()) {
-			await app.vault.modify(file, originals.get(file) ?? '');
+			try {
+				await app.vault.modify(file, originals.get(file) ?? '');
+			} catch (restoreError) {
+				rollbackError ??= restoreError;
+			}
+		}
+		if (rollbackError) {
+			const originalMessage = error instanceof Error ? error.message : String(error);
+			const rollbackMessage = rollbackError instanceof Error
+				? rollbackError.message
+				: String(rollbackError);
+			throw new Error(`${originalMessage}；回滚写入失败：${rollbackMessage}`);
 		}
 		throw error;
 	}
@@ -299,6 +316,97 @@ export async function changeTaskTag(
 		task,
 		add ? addTaskTag(location.lines[location.lineIndex], tag) : removeTaskTag(location.lines[location.lineIndex], tag),
 	);
+}
+
+export async function changeTaskDocumentLink(
+	app: App,
+	task: TaskNode,
+	path: string,
+	add: boolean,
+): Promise<void> {
+	await changeTaskDocumentLinks(app, [{ task, path, add }]);
+}
+
+export async function renameTaskDocumentLink(
+	app: App,
+	task: TaskNode,
+	oldPath: string,
+	newPath: string,
+): Promise<void> {
+	await renameTaskDocumentLinks(app, [task], oldPath, newPath);
+}
+
+export interface TaskDocumentLinkChange {
+	task: TaskNode;
+	path: string;
+	add: boolean;
+}
+
+function normalizeComparablePath(path: string): string {
+	return normalizePath(/\.md$/i.test(path) ? path : `${path}.md`).replace(/^\/+/, '');
+}
+
+function resolveTaskDocumentPath(app: App, task: TaskNode, link: string): string {
+	const withoutExtension = link.replace(/\.md$/i, '');
+	const destination = app.metadataCache.getFirstLinkpathDest(withoutExtension, task.path);
+	return destination?.path ?? normalizeComparablePath(link);
+}
+
+function documentLinkAliases(
+	app: App,
+	task: TaskNode,
+	canonicalPath: string,
+): string[] {
+	const target = normalizeComparablePath(canonicalPath);
+	return task.documentLinks.filter((link) => (
+		normalizeComparablePath(resolveTaskDocumentPath(app, task, link)) === target
+	));
+}
+
+export async function changeTaskDocumentLinks(
+	app: App,
+	changes: TaskDocumentLinkChange[],
+	afterWrite?: () => Promise<void>,
+): Promise<void> {
+	const mutations = new Map<TFile, ContentMutation[]>();
+	changes.forEach(({ task, path, add }) => {
+		const aliases = add ? [] : documentLinkAliases(app, task, path);
+		addMutation(
+			mutations,
+			fileForTask(app, task),
+			transformTaskLine(task, (line) => (
+				add
+					? addDocumentLink(line, path)
+					: removeDocumentLink(line, path, aliases)
+			)),
+		);
+	});
+	await applyFileMutations(app, mutations, afterWrite);
+}
+
+export async function renameTaskDocumentLinks(
+	app: App,
+	tasks: TaskNode[],
+	oldPath: string,
+	newPath: string,
+	afterWrite?: () => Promise<void>,
+	aliasesByTaskId?: Map<string, string[]>,
+): Promise<void> {
+	const mutations = new Map<TFile, ContentMutation[]>();
+	tasks.forEach((task) => {
+		const aliases = [
+			...documentLinkAliases(app, task, oldPath),
+			...(aliasesByTaskId?.get(task.id) ?? []),
+		];
+		addMutation(
+			mutations,
+			fileForTask(app, task),
+			transformTaskLine(task, (line) => (
+				replaceDocumentLink(line, oldPath, newPath, aliases)
+			)),
+		);
+	});
+	await applyFileMutations(app, mutations, afterWrite);
 }
 
 export async function assignTaskId(
